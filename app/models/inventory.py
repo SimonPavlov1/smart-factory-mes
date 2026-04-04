@@ -1,35 +1,56 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, Text
 from app.database import Base
-from datetime import datetime
+
 
 class Component(Base):
+    """
+    Справочник покупных комплектующих (ТМЦ).
+    Содержит неизменяемые технические характеристики деталей.
+    """
     __tablename__ = "components"
 
-    id = Column(Integer, primary_key=True, index=True)
-    category = Column(String)  # Резисторы, Конденсаторы
-    value = Column(String)     # 10k, 1uF
-    package = Column(String)   # 0805, SOT-23
-    part_number = Column(String, unique=True, index=True)
-    datasheet_path = Column(String, nullable=True)
+    id = Column(Integer, primary_key=True, index=True, comment="Уникальный ID детали")
 
-    stock = relationship("Stock", uselist=False, back_populates="component")
+    # Основная информация
+    name = Column(String, nullable=False, index=True, comment="Наименование (напр. Резистор)")
+    part_number = Column(String, unique=True, index=True, nullable=False, comment="Артикул производителя")
+
+    # Классификация
+    category = Column(String, index=True, comment="Группа (IC, Resistors, Connectors)")
+    type = Column(String, comment="Подтип (напр. MLCC, Тонкопленочный)")
+
+    # Технические параметры (Атрибутивный учет)
+    package = Column(String, index=True, comment="Тип корпуса (0603, SOT-23)")
+    value = Column(String, comment="Номинал (10k, 100nF, 3.3V)")
+    tolerance = Column(String, comment="Допуск/Точность (1%, 5%, X7R)")
+
+    # Логистика
+    unit = Column(String, default="pcs", comment="Единица измерения (шт, м, кг)")
+    description = Column(Text, nullable=True, comment="Расширенное текстовое описание")
+    datasheet_path = Column(String, nullable=True, comment="Путь к PDF-файлу документации")
+
 
 class Stock(Base):
+    """
+    Складской учет и адресное хранение.
+    Хранит информацию о физическом количестве и резервах.
+    """
     __tablename__ = "stock"
 
-    component_id = Column(Integer, ForeignKey("components.id"), primary_key=True)
-    actual_qty = Column(Float, default=0.0)
-    reserved_qty = Column(Float, default=0.0)
-    location = Column(String)
+    id = Column(Integer, primary_key=True, index=True, comment="ID записи остатка")
 
-    component = relationship("Component", back_populates="stock")
+    # Связи
+    component_id = Column(
+        Integer,
+        ForeignKey("components.id"),
+        unique=True,
+        nullable=False,
+        comment="Ссылка на ID компонента"
+    )
 
-class Reservation(Base):
-    __tablename__ = "reservations"
+    # Количественные показатели
+    actual_qty = Column(Float, default=0.0, comment="Фактическое количество на складе")
+    reserved_qty = Column(Float, default=0.0, comment="Количество в мягком резерве")
 
-    id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, ForeignKey("orders.id"))
-    component_id = Column(Integer, ForeignKey("components.id"))
-    qty_reserved = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Адресное хранение
+    location = Column(String, index=True, comment="Адрес ячейки хранения (напр. A-01-05)")
