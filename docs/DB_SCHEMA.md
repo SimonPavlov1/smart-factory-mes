@@ -34,7 +34,7 @@
 |                  | `sku`                   | String      | Unique, Index   | Внутренний артикул (напр. РСДТ.123.123) |
 |                  | `is_subassembly`        | Boolean     | Default=False   | Признак узла (плата, кабель питания...) |
 |                  | `revision`              | String      | Default="1.0"   | Версия конструкторской документации     |
-|                  | `bill_of_materials_url` | Nullable    | Default="1.0"   | Ссылка на полный пакет КД               |
+|                  | `bill_of_materials_url` | String      | Nullable        | Ссылка на полный пакет КД               |
 |                  | `description`           | Text        | Nullable        | Описание функционала или ТУ             |
 | **ProductBOM**   | `id`                    | Integer     | PK              | ID строки спецификации                  |
 | (Спецификация)   | `product_id`            | Integer     | FK              | Ссылка на родительское изделие          |
