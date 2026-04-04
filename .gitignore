@@ -11,3 +11,6 @@ venv/
 # App
 storage/
 *.db
+
+#docs
+docs/GIT_GUIDE.md

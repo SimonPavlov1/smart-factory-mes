@@ -1,13 +1,16 @@
 from app.database import engine, Base
-# Импортируем все модели, чтобы Base знала о них
-from app.models.product import ProductType, ProductBOM
-from app.models.inventory import Component, Stock, Reservation
-from app.models.production import Order, Item, ItemStage
+from app.models.inventory import Component, Stock
+from app.models.production import ProductType, ProductBOM, Order, Reservation, Item
+
 
 def init_db():
-    print("Создание таблиц в базе данных...")
+    print("Удаляю старую базу (если есть)...")
+    Base.metadata.drop_all(bind=engine)
+
+    print("Создаю новые таблицы...")
     Base.metadata.create_all(bind=engine)
-    print("База данных готова!")
+    print("Готово! Проверь файл factory.db")
+
 
 if __name__ == "__main__":
     init_db()

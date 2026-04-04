@@ -26,6 +26,7 @@ def get_inventory(db: Session = Depends(get_db)):
     return components
 
 @app.post("/inventory")
+@app.post("/orders")
 def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
     # Создаем запись в таблице заказов
     new_order = Order(
