@@ -31,7 +31,8 @@
 |------------------|-------------------------|-------------|-----------------|-----------------------------------------|
 | **ProductType**  | `id`                    | Integer     | PK, Index       | Уникальный ID изделия                   |
 | (Реестр изделий) | `name`                  | String      | Not Null        | Коммерческое название прибора           |
-|                  | `sku`                   | String      | Unique, Index   | Внутренний артикул (напр. РСДТ.123.123) |
+|                  | `sku`                   | String      | Unique, Index   | Сокращенное название                    |
+|                  | `drawing_number`        | String      | index, nullable | Внутренний артикул (напр. РСДТ.123.123) |
 |                  | `is_subassembly`        | Boolean     | Default=False   | Признак узла (плата, кабель питания...) |
 |                  | `revision`              | String      | Default="1.0"   | Версия конструкторской документации     |
 |                  | `bill_of_materials_url` | String      | Nullable        | Ссылка на полный пакет КД               |
