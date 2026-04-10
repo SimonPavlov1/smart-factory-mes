@@ -1,48 +1,71 @@
+from sqlalchemy.orm import Session
 from app.database import SessionLocal
-from app.models.inventory import Component, Stock
-from app.models.product import ProductType, ProductBOM
-
+from app.models.inventory import Component
+from app.models.production import ProductType, ProductBOM
 
 def seed():
-    db = SessionLocal()
+    db: Session = SessionLocal()
+    print("Наполнение базы данными РСДТ.687281.011 (используем part_number)...")
 
-    # 1. Добавляем компоненты
-    resistor = Component(
-        category="Resistors",
-        value="10k",
-        package="0805",
-        part_number="RES-10K-0805-1%"
-    )
-    mcu = Component(
-        category="IC",
-        value="STM32F103",
-        package="LQFP48",
-        part_number="STM32F103C8T6"
-    )
+    try:
+        # 1. Создаем компоненты
+        components_data = [
+            {"name": "Плата печатная", "pn": "РСДТ.758723.010", "cat": "PCB"},
+            {"name": "Разъем СКК7353NS-1.5-118", "pn": "KINKONG-SKK", "cat": "Connector"},
+            {"name": "Разъем I-DS1070-SCW004", "pn": "Connfly-SCW004", "cat": "Connector"},
+            {"name": "Разъем I-DS1070-SCW006", "pn": "Connfly-SCW006", "cat": "Connector"},
+            {"name": "Разъем XF2M-4015-1A", "pn": "Omron-XF2M", "cat": "Connector"},
+            {"name": "Провод ПВАМ-0,5 белый", "pn": "PVAM-0.5-W", "cat": "Wire"},
+        ]
 
-    db.add_all([resistor, mcu])
-    db.commit()  # Сохраняем, чтобы получить ID
+        created_components = {}
+        for item in components_data:
+            comp = Component(
+                name=item["name"],
+                part_number=item["pn"],
+                category=item["cat"]
+            )
+            db.add(comp)
+            db.flush()
+            created_components[item["pn"]] = comp.id
 
-    # 2. Выставляем остатки на склад
-    stock_res = Stock(component_id=resistor.id, actual_qty=1000, location="A-1-1")
-    stock_mcu = Stock(component_id=mcu.id, actual_qty=50, location="B-2-4")
+        # 2. Создаем изделие
+        product_a1 = ProductType(
+            name="Плата А1",
+            sku="A1-BOARD",
+            drawing_number="РСДТ.687281.011",
+            is_subassembly=True,
+            description="Спецификация из файла РСДТ.687281.011"
+        )
+        db.add(product_a1)
+        db.flush()
 
-    db.add_all([stock_res, stock_mcu])
+        # 3. Наполняем BOM данными
+        bom_items = [
+            {"res_id": created_components["РСДТ.758723.010"], "qty": 1.0, "des": None},
+            {"res_id": created_components["KINKONG-SKK"], "qty": 1.0, "des": "X100"},
+            {"res_id": created_components["Connfly-SCW004"], "qty": 1.0, "des": "X30"},
+            {"res_id": created_components["Connfly-SCW006"], "qty": 1.0, "des": "X2"},
+            {"res_id": created_components["Omron-XF2M"], "qty": 1.0, "des": "X1"},
+            {"res_id": created_components["PVAM-0.5-W"], "qty": 2.0, "des": "м"},
+        ]
 
-    # 3. Создаем тип изделия (например, "Датчик температуры")
-    sensor = ProductType(name="Smart Temp Sensor", decimal_number="ST-001-REV1")
-    db.add(sensor)
-    db.commit()
+        for item in bom_items:
+            db.add(ProductBOM(
+                product_id=product_a1.id,
+                resource_id=item["res_id"],
+                resource_type="component",
+                quantity=item["qty"],
+                designators=item["des"]
+            ))
 
-    # 4. Прописываем состав (BOM) — для одного датчика нужно 4 резистора и 1 МС
-    bom1 = ProductBOM(product_id=sensor.id, component_id=resistor.id, quantity=4, designator="R1-R4")
-    bom2 = ProductBOM(product_id=sensor.id, component_id=mcu.id, quantity=1, designator="U1")
-
-    db.add_all([bom1, bom2])
-    db.commit()
-    db.close()
-    print("Тестовые данные успешно загружены!")
-
+        db.commit()
+        print("База успешно наполнена!")
+    except Exception as e:
+        db.rollback()
+        print(f"Ошибка при наполнении: {e}")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     seed()
