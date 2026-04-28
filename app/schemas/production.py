@@ -1,33 +1,64 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
+
 class BOMItemBase(BaseModel):
-    """Базовая схема для элемента состава изделия (BOM)"""
-    design_name: str           # Оригинальное название из ПЭ3
-    designators: Optional[str] # Позиционные обозначения (C1, R1-R5)
-    quantity: float            # Количество
-    category: Optional[str]    # Категория, определенная парсером
+    """Базовая схема элемента из ПЭ3 (соответствует колонкам документа)"""
+    # Колонка "Поз. обозначение" [cite: 115, 116]
+    designators: str = Field(..., example="C36-C47", description="Позиционные обозначения")
+
+    # Колонка "Наименование"
+    design_name: str = Field(..., example="Конденсатор CC0603MRX5R8BB106 YAGEO",
+                             description="Полный текст из документа")
+
+    # Колонка "Кол."
+    quantity: float = Field(..., example=12.0, description="Количество элементов")
+
 
 class BOMItemCreate(BOMItemBase):
-    """Схема для создания/импорта элемента"""
-    resource_id: int = 0       # ID из справочника (0 если не найдено)
-    is_resolved: bool = False  # Флаг: найдена ли деталь в базе
-    is_assembly: bool = False  # Флаг: является ли это узлом/сборкой
-    components: Optional[List['BOMItemCreate']] = [] # Для вложенных сборок
+    """Схема для создания и процесса сопоставления"""
+    # Ссылка на id из Component (inventory.py)
+    resource_id: int = 0
 
-# Обновляем ссылки для поддержки рекурсии (вложенных компонентов)
+    # Тип ресурса: покупная деталь (component) или собственный узел (product)
+    resource_type: str = "component"
+
+    # Статус: нашла ли система деталь на складе автоматически
+    is_resolved: bool = False
+
+    # Категория для парсера (Конденсаторы, Резисторы и т.д.) [cite: 118, 196, 199]
+    category: Optional[str] = None
+
+    # Для многоуровневых спецификаций (сборка внутри сборки)
+    is_assembly: bool = False
+    components: Optional[List['BOMItemCreate']] = []
+
+
+# Обновляем ссылки для поддержки вложенности
 BOMItemCreate.update_forward_refs()
 
-class ProductCreateSchema(BaseModel):
-    """Схема для создания всего изделия целиком"""
-    name: str
-    drawing_number: str
-    version: str
-    is_final: bool = False
-    components: List[BOMItemCreate]
+
+class BOMItemResponse(BOMItemBase):
+    """Схема для отдачи данных на фронтенд (чтение из БД)"""
+    id: int
+    resource_id: int
+    is_resolved: bool
+
+    class Config:
+        from_attributes = True
+
 
 class BOMUploadResponse(BaseModel):
-    """Схема ответа после загрузки и парсинга файла"""
+    """Схема ответа после массовой обработки списка строк"""
     product_id: int
     total_items: int
-    items: List[BOMItemCreate]
+    items: List[BOMItemResponse]
+
+
+class ProductCreateSchema(BaseModel):
+    """Схема для инициализации нового изделия (согласно штампу ПЭ3)"""
+    name: str = Field(..., example="Плата управления")  # [cite: 179]
+    drawing_number: str = Field(..., example="РСДТ.421243.320")  # [cite: 178]
+    version: Optional[str] = "1"
+    is_final: bool = False
+    components: List[BOMItemCreate]
