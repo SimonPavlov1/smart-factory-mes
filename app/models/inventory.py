@@ -1,56 +1,32 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, Text
+from sqlalchemy.orm import relationship
 from app.database import Base
 
 
 class Component(Base):
-    """
-    Справочник покупных комплектующих (ТМЦ).
-    Содержит неизменяемые технические характеристики деталей.
-    """
+    """Справочник ТМЦ. Сюда парсер будет подставлять извлеченные данные."""
     __tablename__ = "components"
 
-    id = Column(Integer, primary_key=True, index=True, comment="Уникальный ID детали")
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, index=True, comment="Напр. 'Резистор'")
+    part_number = Column(String, unique=True, index=True, nullable=False, comment="MPN артикул")
+    category = Column(String, index=True)
+    package = Column(String, index=True, comment="Корпус, напр. '0603'")
 
-    # Основная информация
-    name = Column(String, nullable=False, index=True, comment="Наименование (напр. Резистор)")
-    part_number = Column(String, unique=True, index=True, nullable=False, comment="Артикул производителя")
+    # Эти поля важны для сопоставления
+    value = Column(String, comment="Номинал строкой")
+    voltage = Column(Float, nullable=True)
 
-    # Классификация
-    category = Column(String, index=True, comment="Группа (IC, Resistors, Connectors)")
-    type = Column(String, comment="Подтип (напр. MLCC, Тонкопленочный)")
-
-    # Технические параметры (Атрибутивный учет)
-    package = Column(String, index=True, comment="Тип корпуса (0603, SOT-23)")
-    value = Column(String, comment="Номинал (10k, 100nF, 3.3V)")
-    tolerance = Column(String, comment="Допуск/Точность (1%, 5%, X7R)")
-
-    # Логистика
-    unit = Column(String, default="pcs", comment="Единица измерения (шт, м, кг)")
-    description = Column(Text, nullable=True, comment="Расширенное текстовое описание")
-    datasheet_path = Column(String, nullable=True, comment="Путь к PDF-файлу документации")
+    stock = relationship("Stock", back_populates="component", uselist=False)
 
 
 class Stock(Base):
-    """
-    Складской учет и адресное хранение.
-    Хранит информацию о физическом количестве и резервах.
-    """
+    """Остатки на складе."""
     __tablename__ = "stock"
+    id = Column(Integer, primary_key=True, index=True)
+    component_id = Column(Integer, ForeignKey("components.id"), unique=True, nullable=True)
+    product_id = Column(Integer, ForeignKey("product_types.id"), unique=True, nullable=True)
+    actual_qty = Column(Float, default=0.0)
+    location = Column(String, default="Warehouse-1")
 
-    id = Column(Integer, primary_key=True, index=True, comment="ID записи остатка")
-
-    # Связи
-    component_id = Column(
-        Integer,
-        ForeignKey("components.id"),
-        unique=True,
-        nullable=False,
-        comment="Ссылка на ID компонента"
-    )
-
-    # Количественные показатели
-    actual_qty = Column(Float, default=0.0, comment="Фактическое количество на складе")
-    reserved_qty = Column(Float, default=0.0, comment="Количество в мягком резерве")
-
-    # Адресное хранение
-    location = Column(String, index=True, comment="Адрес ячейки хранения (напр. A-01-05)")
+    component = relationship("Component", back_populates="stock")
