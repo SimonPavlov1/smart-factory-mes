@@ -8,7 +8,7 @@ from app.models.inventory import Component
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
 from app.services.bom_service import BOMMatchingService
 
-router = APIRouter(prefix="/production", tags=["Производство (Production)"])
+router = APIRouter(tags=["Производство (Production)"])
 
 @router.get("/products")
 def get_all_products(db: Session = Depends(get_db)):

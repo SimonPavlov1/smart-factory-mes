@@ -4,7 +4,7 @@ from app.database import get_db
 from app.models.procurement import PurchaseOrder, PurchaseItem
 from app.models.inventory import Stock
 
-router = APIRouter(prefix="/procurement", tags=["Закупки (Procurement)"])
+router = APIRouter(tags=["Закупки (Procurement)"])
 
 @router.post("/orders")
 def create_purchase_order(supplier: str, db: Session = Depends(get_db)):
