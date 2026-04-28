@@ -3,62 +3,85 @@ from typing import List, Optional
 
 
 class BOMItemBase(BaseModel):
-    """Базовая схема элемента из ПЭ3 (соответствует колонкам документа)"""
-    # Колонка "Поз. обозначение" [cite: 115, 116]
-    designators: str = Field(..., example="C36-C47", description="Позиционные обозначения")
-
-    # Колонка "Наименование"
-    design_name: str = Field(..., example="Конденсатор CC0603MRX5R8BB106 YAGEO",
-                             description="Полный текст из документа")
-
-    # Колонка "Кол."
-    quantity: float = Field(..., example=12.0, description="Количество элементов")
+    """
+    Базовая структура строки состава (BOM).
+    Эти поля — прямой слепок из таблицы ПЭ3 (Перечень элементов).
+    """
+    designators: str = Field(
+        ...,
+        example="C36-C47",
+        description="Позиционные обозначения на плате"
+    )
+    design_name: str = Field(
+        ...,
+        example="Конденсатор CC0603MRX5R8BB106 YAGEO",
+        description="Текст из колонки 'Наименование' (основа для поиска)"
+    )
+    quantity: float = Field(
+        ...,
+        example=12.0,
+        description="Количество единиц на 1 изделие"
+    )
 
 
 class BOMItemCreate(BOMItemBase):
-    """Схема для создания и процесса сопоставления"""
-    # Ссылка на id из Component (inventory.py)
-    resource_id: int = 0
+    """
+    Схема для создания записи или ручного ввода.
+    Включает технические поля, необходимые для сопоставления со складом.
+    """
+    # Если мы не знаем ID детали на складе, ставим 0
+    resource_id: Optional[int] = Field(default=0, description="ID компонента или узла в базе")
 
-    # Тип ресурса: покупная деталь (component) или собственный узел (product)
-    resource_type: str = "component"
+    # 'component' (покупное) или 'product' (собственная сборка)
+    resource_type: str = Field(default="component", description="Тип ресурса")
 
-    # Статус: нашла ли система деталь на складе автоматически
-    is_resolved: bool = False
+    # Флаг: удалось ли системе найти деталь в справочнике
+    is_resolved: bool = Field(default=False, description="Статус сопоставления")
 
-    # Категория для парсера (Конденсаторы, Резисторы и т.д.) [cite: 118, 196, 199]
-    category: Optional[str] = None
+    # Группа ТМЦ (заполняется парсером или человеком)
+    category: Optional[str] = Field(default=None, description="Категория (Резисторы, ИС и т.д.)")
 
-    # Для многоуровневых спецификаций (сборка внутри сборки)
-    is_assembly: bool = False
-    components: Optional[List['BOMItemCreate']] = []
+    # Флаг вложенности: является ли эта строка другой платой/сборкой
+    is_assembly: bool = Field(default=False, description="Является ли позиция узлом")
+
+    # Список вложенных компонентов (для рекурсивной сборки изделий)
+    components: List['BOMItemCreate'] = Field(default_factory=list)
 
 
-# Обновляем ссылки для поддержки вложенности
+# Необходимая команда для работы рекурсии (когда BOMItemCreate содержит List[BOMItemCreate])
 BOMItemCreate.update_forward_refs()
 
 
 class BOMItemResponse(BOMItemBase):
-    """Схема для отдачи данных на фронтенд (чтение из БД)"""
+    """
+    Схема для выдачи данных из БД.
+    Используется для отображения состава в интерфейсе.
+    """
     id: int
-    resource_id: int
+    resource_id: Optional[int]
     is_resolved: bool
 
     class Config:
+        # Позволяет Pydantic читать данные напрямую из объектов SQLAlchemy
         from_attributes = True
 
 
 class BOMUploadResponse(BaseModel):
-    """Схема ответа после массовой обработки списка строк"""
+    """Ответ сервера после массовой загрузки или парсинга документа"""
     product_id: int
     total_items: int
     items: List[BOMItemResponse]
 
 
 class ProductCreateSchema(BaseModel):
-    """Схема для инициализации нового изделия (согласно штампу ПЭ3)"""
-    name: str = Field(..., example="Плата управления")  # [cite: 179]
-    drawing_number: str = Field(..., example="РСДТ.421243.320")  # [cite: 178]
-    version: Optional[str] = "1"
-    is_final: bool = False
-    components: List[BOMItemCreate]
+    """
+    Схема создания нового изделия (верхний уровень).
+    Заполняется данными из 'штампа' чертежа или вручную.
+    """
+    name: str = Field(..., example="Плата управления", description="Название изделия")
+    drawing_number: str = Field(..., example="РСДТ.421243.320", description="Децимальный номер")
+    version: str = Field(default="1", description="Версия/ревизия КД")
+    is_final: bool = Field(default=False, description="Флаг готового продукта (не полуфабрикат)")
+
+    # Список всех строк состава, включая вложенные узлы
+    components: List[BOMItemCreate] = Field(default_factory=list)
