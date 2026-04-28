@@ -25,8 +25,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
     new_product = ProductType(
         name=data.name,
         drawing_number=data.drawing_number,
-        version=data.version,
-        is_final=data.is_final,
+        revision=data.version,
         # Если изделие не финальное, значит это промежуточный узел (subassembly)
         is_subassembly=not data.is_final
     )
