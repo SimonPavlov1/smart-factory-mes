@@ -6,19 +6,21 @@ from app.database import get_db
 from app.models.production import ProductType, ProductBOM
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
 
-# Сохраняем твой старый сервис для метода process_manual_bom
-from app.services.bom_service import BOMMatchingService as LegacyBOMService
+# Используем единый сервис для всех операций с BOM
+from app.services.bom_service import BOMMatchingService
 
 router = APIRouter(tags=["Производство (Production)"])
 
 
 def create_product_recursive(data: ProductCreateSchema, db: Session):
     """
-    Рекурсивная функция для создания изделия и всей его иерархии (состава).
+    Рекурсивная сборка изделия.
 
-    Позволяет одной транзакцией создать главную плату и все вложенные узлы.
+    Позволяет создать "дерево" изделия любой вложенности за один вызов.
+    Если компонент помечен как сборка (is_assembly=True), функция вызывает
+    саму себя, создает дочерний узел и привязывает его ID к родителю.
     """
-    # 1. Создаем основную запись об изделии
+    # 1. Создаем "голову" изделия (Плата или Узел)
     new_product = ProductType(
         name=data.name,
         drawing_number=data.drawing_number,
@@ -27,13 +29,14 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
     )
 
     db.add(new_product)
-    # Получаем ID без завершения транзакции
+    # flush() синхронизирует объект с БД, чтобы получить ID, но не закрывает транзакцию.
+    # Это позволяет откатить всё создание целиком при ошибке во вложенных узлах.
     db.flush()
 
     for item in data.components:
         current_resource_id = item.resource_id
 
-        # 2. Обработка вложенных сборок (рекурсия)
+        # 2. Логика рекурсии: если внутри BOM сидит другая сборка
         if item.is_assembly and item.components:
             sub_data = ProductCreateSchema(
                 name=item.design_name,
@@ -42,16 +45,17 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
                 is_final=False,
                 components=item.components
             )
+            # Рекурсивный вызов для создания вложенного узла
             sub_product = create_product_recursive(sub_data, db)
             current_resource_id = sub_product.id
 
-        # 3. Создаем строку спецификации (BOM)
+        # 3. Сохранение строки спецификации (BOM)
         bom_entry = ProductBOM(
             product_id=new_product.id,
             designators=item.designators,
             design_name=item.design_name,
             quantity=item.quantity,
-            # Важно: записываем None вместо 0 для связей (Foreign Keys)
+            # Если resource_id пришел как 0, в базу пишем None для корректной работы FK
             resource_id=current_resource_id if current_resource_id != 0 else None,
             resource_type="product" if item.is_assembly else "component",
             is_resolved=item.is_resolved
@@ -63,7 +67,10 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 
 @router.get("/products")
 def get_all_products(db: Session = Depends(get_db)):
-    """Получить список всех изделий с подгрузкой состава (BOM)."""
+    """
+    Получение списка всех изделий.
+    Использует selectinload для 'жадной' загрузки BOM, чтобы избежать проблемы N+1 запросов.
+    """
     return db.query(ProductType).options(
         selectinload(ProductType.components)
     ).all()
@@ -73,17 +80,17 @@ def get_all_products(db: Session = Depends(get_db)):
 def setup_product(data: ProductCreateSchema, db: Session = Depends(get_db)):
     """
     Атомарная загрузка структуры изделия.
-    Либо создается все дерево с вложенными узлами, либо ничего.
+    Либо создается все дерево (со всеми вложенными платами), либо ничего.
     """
     try:
         product = create_product_recursive(data, db)
-        db.commit()
+        db.commit()  # Завершаем транзакцию только если всё создалось успешно
         db.refresh(product)
         return product
     except Exception as e:
-        db.rollback()
-        print(f"Ошибка сохранения структуры: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка при создании изделия: {str(e)}")
+        db.rollback()  # Отмена всех изменений при любой ошибке
+        print(f"Ошибка в транзакции: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка создания структуры: {str(e)}")
 
 
 @router.post("/process-bom/{product_id}", response_model=BOMUploadResponse)
@@ -92,12 +99,15 @@ def process_manual_bom(
         items: List[BOMItemCreate],
         db: Session = Depends(get_db)
 ):
-    """Ручное добавление компонентов в существующий BOM через Legacy сервис."""
+    """
+    Ручное добавление позиций в уже существующую плату.
+    Сразу пытается сопоставить добавленные строки со складом.
+    """
     if not items:
-        raise HTTPException(status_code=400, detail="Список пуст")
+        raise HTTPException(status_code=400, detail="Список компонентов пуст")
 
     raw_data = [item.dict() for item in items]
-    matching_service = LegacyBOMService(db)
+    matching_service = BOMMatchingService(db)
     processed_items = matching_service.process_bom_data(product_id, raw_data)
 
     return {
@@ -111,11 +121,11 @@ def process_manual_bom(
 def resolve_bom(product_id: int, db: Session = Depends(get_db)):
     """
     Интеллектуальный запуск маппинга.
-    Связывает строки BOM с реальным складом (ТМЦ).
-    """
-    # Локальный импорт внутри функции решает проблему циклической зависимости
-    from app.services.matching_service import BOMMatchingService
 
+    Пробегает по всем неразрешенным строкам изделия и пытается найти
+    их в справочнике ТМЦ или в таблице уже заученных сопоставлений (BOMMapping).
+    """
+    # Вызываем статический метод из нашего единого сервиса
     matched_count = BOMMatchingService.resolve_components(product_id, db)
 
     return {

@@ -7,24 +7,47 @@ from app.logic.bom_parser import parse_with_context
 
 class BOMMatchingService:
     """
-    Сервис сопоставления спецификации (BOM).
-    Отвечает за привязку текстовых строк из ПЭ3 к реальным ID компонентов на складе.
+    Единый сервис сопоставления спецификации (BOM).
+    Интегрирует ручную загрузку и автоматический фоновый маппинг.
     """
 
     def __init__(self, db: Session):
         self.db = db
-        # Храним категорию (напр. "Конденсаторы"), которая была встречена последней,
-        # так как в ПЭ3 заголовок идет один раз для группы деталей.
+        # Категория для контекстного поиска (напр. "Резисторы")
         self.current_category: Optional[str] = "Other"
 
-    def process_bom_data(self, product_id: int, extracted_rows: List[Dict]) -> List[ProductBOM]:
+    @staticmethod
+    def resolve_components(product_id: int, db: Session) -> int:
         """
-        Массово обрабатывает список строк, полученных из парсера PDF/Excel.
+        Метод для вызова из API (POST /resolve-bom).
+        Пробегает по уже созданным записям в БД и пытается их 'разрешить'.
+        """
+        service = BOMMatchingService(db)
 
-        Args:
-            product_id: ID изделия, для которого создается спецификация.
-            extracted_rows: Список словарей с ключами 'designators', 'name', 'quantity'.
-        """
+        # Запрашиваем только нераспознанные строки этого изделия
+        items_to_resolve = db.query(ProductBOM).filter(
+            ProductBOM.product_id == product_id,
+            ProductBOM.is_resolved == False
+        ).all()
+
+        matched_count = 0
+        for item in items_to_resolve:
+            # Используем каскадный поиск (Маппинг -> Артикул -> Параметры)
+            res_id = service._find_best_match(item.design_name)
+
+            if res_id:
+                item.resource_id = res_id
+                item.is_resolved = True
+                matched_count += 1
+            else:
+                # Если не нашли — регистрируем в таблице обучения
+                service._ensure_mapping_exists(item.design_name)
+
+        db.commit()
+        return matched_count
+
+    def process_bom_data(self, product_id: int, extracted_rows: List[Dict]) -> List[ProductBOM]:
+        """Первичная обработка данных при загрузке (напр. из парсера)."""
         bom_items = []
 
         for row in extracted_rows:
@@ -32,95 +55,70 @@ class BOMMatchingService:
             designators = row.get("designators", "")
             quantity = row.get("quantity", 0)
 
-            # 1. ОПРЕДЕЛЕНИЕ КОНТЕКСТА (Заголовок раздела)
-            # Если в строке нет позиционных обозначений (C1, R1), но есть текст -
-            # скорее всего, это заголовок раздела (напр. "Микросхемы").
+            # Определение заголовка раздела (категории)
             if not designators and design_name and len(design_name.split()) < 3:
                 self.current_category = design_name
                 continue
 
-            # 2. ПОИСК СОПОСТАВЛЕНИЯ (Matching)
-            # Пытаемся найти ID компонента через многоуровневый поиск
             component_id = self._find_best_match(design_name)
 
-            # 3. СОХРАНЕНИЕ В СОСТАВ ИЗДЕЛИЯ
-            # Создаем запись в ProductBOM. Если ресурс не найден, ставим 0 (нужна ручная привязка)
             bom_item = ProductBOM(
                 product_id=product_id,
                 design_name=design_name,
                 designators=designators,
                 quantity=float(quantity),
-                resource_id=component_id if component_id else 0,
+                resource_id=component_id if component_id else None,
                 resource_type="component",
-                is_resolved=True if component_id else False  # Флаг "Готово" для фронтенда
+                is_resolved=True if component_id else False
             )
 
             self.db.add(bom_item)
             bom_items.append(bom_item)
 
-            # 4. ОБУЧЕНИЕ СИСТЕМЫ
-            # Если деталь не опознана, создаем "черновик" в таблице маппинга.
-            # После того как закупщик один раз привяжет ее вручную, система запомнит выбор.
             if not component_id:
                 self._ensure_mapping_exists(design_name)
 
-        # Сохраняем все изменения в БД одним пакетом
         self.db.commit()
         return bom_items
 
     def _find_best_match(self, design_name: str) -> Optional[int]:
-        """
-        Каскадный поиск компонента (от точного к вероятностному).
-        """
+        """Каскадный поиск: от точного к вероятностному."""
+        if not design_name:
+            return None
 
-        # УРОВЕНЬ А: ПРОВЕРКА МАППИНГА (Память системы)
-        # Ищем, не связывали ли мы ЭТУ ЖЕ строку с каким-то ID ранее
-        mapping = self.db.query(BOMMapping).filter(
-            BOMMapping.design_name == design_name
-        ).first()
+        # УРОВЕНЬ А: Проверка памяти (BOMMapping)
+        mapping = self.db.query(BOMMapping).filter(BOMMapping.design_name == design_name).first()
         if mapping and mapping.component_id:
             return mapping.component_id
 
-        # УРОВЕНЬ Б: ПРЯМОЙ ПОИСК ПО PART NUMBER
-        # Проверяем, не является ли всё название детали артикулом (MPN)
+        # УРОВЕНЬ Б: Прямой поиск по артикулу (Part Number)
+        clean_name = design_name.split()[0].strip()
         component = self.db.query(Component).filter(
-            Component.part_number == design_name
+            (Component.part_number == design_name) |
+            (Component.part_number.ilike(f"{clean_name}%"))
         ).first()
         if component:
             return component.id
 
-        # УРОВЕНЬ В: ПАРАМЕТРИЧЕСКИЙ ПОИСК (Умный поиск)
-        # Запускаем логику bom_parser для вычленения характеристик (10кОм, 0603 и т.д.)
+        # УРОВЕНЬ В: Параметрический поиск (через парсер номиналов)
         parsed = parse_with_context(design_name, self.current_category)
-
-        # Если удалось вытащить и номинал, и корпус - ищем "функциональный аналог"
         if parsed.get("value_numeric") and parsed.get("package"):
-            similar_component = self.db.query(Component).filter(
+            similar = self.db.query(Component).filter(
                 Component.package == parsed["package"],
-                Component.value_numeric == parsed["value_numeric"],
-                # Используем поиск по вхождению категории (напр. "Resistors" в названии)
-                Component.category.ilike(f"%{parsed['category']}%")
+                Component.value_numeric == parsed["value_numeric"]
             ).first()
+            if similar:
+                return similar.id
 
-            if similar_component:
-                return similar_component.id
-
-        # Если все уровни не дали результата - возвращаем None
         return None
 
     def _ensure_mapping_exists(self, design_name: str):
-        """
-        Создает пустую запись в словаре маппинга.
-        Это позволит закупщику увидеть "неразрешенные" позиции в интерфейсе.
-        """
-        exists = self.db.query(BOMMapping).filter(
-            BOMMapping.design_name == design_name
-        ).first()
-
+        """Создает пустую запись для ручного маппинга закупщиком."""
+        exists = self.db.query(BOMMapping).filter(BOMMapping.design_name == design_name).first()
         if not exists:
             new_mapping = BOMMapping(
                 design_name=design_name,
-                mapping_type="auto",  # Пометка, что создано автоматически парсером
-                is_verified=False  # Требует подтверждения человеком
+                mapping_type="auto",
+                is_verified=False
             )
             self.db.add(new_mapping)
