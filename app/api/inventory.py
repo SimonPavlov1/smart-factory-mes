@@ -32,6 +32,7 @@ def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
         category=data.category,
         package=data.package,
         value=data.value,
+        value_numeric=data.value_numeric,
         voltage=data.voltage,
         specifications=data.specifications  # SQLAlchemy сама упакует dict в JSON
     )

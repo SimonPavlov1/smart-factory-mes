@@ -9,6 +9,7 @@ class ComponentCreate(BaseModel):
     category: Optional[str] = Field(None, example="Резисторы")
     package: Optional[str] = Field(None, example="0603")
     value: Optional[str] = Field(None, example="4.99k")
+    value_numeric: Optional[float] = Field(None, example="10000.0")
     voltage: Optional[float] = Field(None, example=50.0)
 
     # Гибкое поле для доп. характеристик

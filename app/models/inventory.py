@@ -21,6 +21,7 @@ class Component(Base):
 
     # Общие электротехнические параметры для быстрой фильтрации
     value = Column(String, comment="Номинальное значение (напр. '10uF', '4.7k')")
+    value_numeric = Column(Float, nullable=True, comment="Приведенное значение (напр. '10000.0')")
     voltage = Column(Float, nullable=True, comment="Рабочее напряжение, В")
 
     # Поле для гибких метаданных.
