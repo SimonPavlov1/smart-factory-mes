@@ -1,53 +1,55 @@
 from sqlalchemy.orm import Session
-from app.models.production import ProductComponent
+# Мы заменили ProductComponent на ProductBOM, так как это имя в твоих моделях
+from app.models.production import ProductBOM
 from app.models.inventory import Component
 
 
 class BOMMatchingService:
     """
-    Сервис для автоматической привязки позиций из BOM (состава изделия)
-    к реальным записям в справочнике ТМЦ (складе).
+    Интеллектуальный сервис сопоставления состава изделия со складом.
+    Связывает текстовые записи в BOM с реальными ID компонентов ТМЦ.
     """
 
     @staticmethod
     def resolve_components(product_id: int, db: Session) -> int:
         """
-        Проходит по списку компонентов изделия и сопоставляет их со складом.
+        Ищет совпадения для всех нераспознанных позиций в конкретном изделии.
 
-        Алгоритм:
-        1. Извлекает все записи ProductComponent, которые еще не привязаны (is_resolved=False).
-        2. Очищает поле design_name (берет первое слово как основной артикул).
-        3. Ищет частичное совпадение в справочнике ТМЦ по part_number.
-        4. В случае успеха — связывает запись с resource_id и ставит флаг готовности.
+        Логика:
+        1. Находит строки ProductBOM, где is_resolved == False.
+        2. Извлекает артикул (первое слово) из design_name.
+        3. Ищет этот артикул в справочнике ТМЦ.
         """
-        # Получаем список нерешенных задач для конкретного изделия
-        unresolved_items = db.query(ProductComponent).filter(
-            ProductComponent.product_id == product_id,
-            ProductComponent.is_resolved == False
+
+        # Запрашиваем из базы только нераспознанные компоненты этого изделия
+        unresolved_items = db.query(ProductBOM).filter(
+            ProductBOM.product_id == product_id,
+            ProductBOM.is_resolved == False
         ).all()
 
         matched_count = 0
 
         for item in unresolved_items:
-            # Предобработка: берем артикул (напр. 'RC0603FR-074K99L' из 'RC0603FR-074K99L Yageo')
-            # Очищаем от пробелов и приводим к верхнему регистру для поиска
-            raw_design_name = item.design_name or ""
-            search_query = raw_design_name.split()[0].strip().upper()
-
-            if not search_query:
+            # Пропускаем, если название не указано
+            if not item.design_name:
                 continue
 
-            # Поиск в справочнике ТМЦ. Используем ilike для регистронезависимости
+            # Берем первое слово (артикул) и чистим от лишнего
+            # "RC0603FR-074K99L YAGEO" -> "RC0603FR-074K99L"
+            search_query = item.design_name.split()[0].strip()
+
+            # Ищем в справочнике ТМЦ (регистронезависимо)
             match = db.query(Component).filter(
                 Component.part_number.ilike(f"{search_query}%")
             ).first()
 
             if match:
-                # Привязываем найденный компонент
+                # Если нашли — привязываем ID из склада и ставим флаг готовности
                 item.resource_id = match.id
                 item.is_resolved = True
                 matched_count += 1
 
-        # Сохраняем все изменения в БД одним транзакционным блоком
+        # Сохраняем все изменения в базе
         db.commit()
+
         return matched_count
