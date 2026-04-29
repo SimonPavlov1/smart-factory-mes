@@ -82,16 +82,18 @@ class BOMMatchingService:
         return bom_items
 
     def _find_best_match(self, design_name: str) -> Optional[int]:
-        """Каскадный поиск: от точного к вероятностному."""
+        """Каскадный поиск: от точного к параметрическому (аналоги)."""
         if not design_name:
             return None
 
-        # УРОВЕНЬ А: Проверка памяти (BOMMapping)
+        # УРОВЕНЬ А: ПРОВЕРКА ПАМЯТИ (BOMMapping)
+        # Самый быстрый путь: если мы уже обучали систему этой строке
         mapping = self.db.query(BOMMapping).filter(BOMMapping.design_name == design_name).first()
         if mapping and mapping.component_id:
             return mapping.component_id
 
-        # УРОВЕНЬ Б: Прямой поиск по артикулу (Part Number)
+        # УРОВЕНЬ Б: ПОИСК ПО АРТИКУЛУ (Part Number)
+        # Проверяем первое слово (MPN). Например, "RC0603..."
         clean_name = design_name.split()[0].strip()
         component = self.db.query(Component).filter(
             (Component.part_number == design_name) |
@@ -100,15 +102,23 @@ class BOMMatchingService:
         if component:
             return component.id
 
-        # УРОВЕНЬ В: Параметрический поиск (через парсер номиналов)
+        # УРОВЕНЬ В: ПАРАМЕТРИЧЕСКИЙ ПОИСК (Поиск аналогов)
+        # Если артикул не найден, парсим строку на номинал и корпус
         parsed = parse_with_context(design_name, self.current_category)
+
+        # Если удалось вытащить 10кОм (10000) и 0603
         if parsed.get("value_numeric") and parsed.get("package"):
-            similar = self.db.query(Component).filter(
+            # Ищем на складе ЛЮБОЙ компонент с такими же ТТХ
+            # Здесь Yageo и Samsung встретятся, так как у них одинаковые параметры
+            similar_component = self.db.query(Component).filter(
                 Component.package == parsed["package"],
-                Component.value_numeric == parsed["value_numeric"]
+                Component.value_numeric == parsed["value_numeric"],
+                # Категория помогает не перепутать резистор с конденсатором
+                Component.category.ilike(f"%{parsed.get('category', self.current_category)}%")
             ).first()
-            if similar:
-                return similar.id
+
+            if similar_component:
+                return similar_component.id
 
         return None
 
