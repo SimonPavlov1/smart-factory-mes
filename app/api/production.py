@@ -118,3 +118,25 @@ def process_manual_bom(
         "total_items": len(processed_items),
         "items": processed_items
     }
+
+
+@router.post("/products/{product_id}/resolve-bom")
+def resolve_bom(product_id: int, db: Session = Depends(get_db)):
+    """
+    Интеллектуальное сопоставление BOM.
+
+    Запускает BOMMatchingService, который пытается автоматически найти
+    подходящие детали на складе для всех позиций в составе изделия.
+    """
+    from app.services.matching_service import BOMMatchingService
+
+    # Вызываем логику сопоставления
+    matched_count = BOMMatchingService.resolve_components(product_id, db)
+
+    # Если ничего не нашли, это не ошибка 404, а просто информационное сообщение
+    return {
+        "status": "success",
+        "product_id": product_id,
+        "matched_items": matched_count,
+        "message": f"Автоматически привязано компонентов: {matched_count}"
+    }
