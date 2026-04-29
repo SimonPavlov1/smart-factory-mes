@@ -5,7 +5,9 @@ from typing import List
 from app.database import get_db
 from app.models.production import ProductType, ProductBOM
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
-from app.services.bom_service import BOMMatchingService
+
+# Сохраняем твой старый сервис для метода process_manual_bom
+from app.services.bom_service import BOMMatchingService as LegacyBOMService
 
 router = APIRouter(tags=["Производство (Production)"])
 
@@ -14,33 +16,25 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
     """
     Рекурсивная функция для создания изделия и всей его иерархии (состава).
 
-    Логика:
-    1. Создает запись в таблице изделий (ProductType).
-    2. Если в составе есть вложенный узел (is_assembly=True), функция вызывает
-       саму себя, чтобы сначала создать этот узел и получить его ID.
-    3. Создает записи в таблице состава (ProductBOM), связывая их с изделием.
+    Позволяет одной транзакцией создать главную плату и все вложенные узлы.
     """
-
-    # Создаем основную запись об изделии (плате или блоке)
+    # 1. Создаем основную запись об изделии
     new_product = ProductType(
         name=data.name,
         drawing_number=data.drawing_number,
         revision=data.version,
-        # Если изделие не финальное, значит это промежуточный узел (subassembly)
         is_subassembly=not data.is_final
     )
 
     db.add(new_product)
-    # flush() отправляет данные в БД и получает сгенерированный ID,
-    # но не завершает транзакцию (позволяет откатиться при ошибке)
+    # Получаем ID без завершения транзакции
     db.flush()
 
     for item in data.components:
         current_resource_id = item.resource_id
 
-        # Обработка вложенных сборок (рекурсия)
+        # 2. Обработка вложенных сборок (рекурсия)
         if item.is_assembly and item.components:
-            # Преобразуем данные компонента в схему изделия для рекурсивного вызова
             sub_data = ProductCreateSchema(
                 name=item.design_name,
                 drawing_number=f"SUB-{item.designators}-{new_product.drawing_number}",
@@ -49,16 +43,15 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
                 components=item.components
             )
             sub_product = create_product_recursive(sub_data, db)
-            # ID созданного узла становится resource_id для текущей строки состава
             current_resource_id = sub_product.id
 
-        # Создаем строку спецификации (BOM)
+        # 3. Создаем строку спецификации (BOM)
         bom_entry = ProductBOM(
             product_id=new_product.id,
             designators=item.designators,
             design_name=item.design_name,
             quantity=item.quantity,
-            # В БД записываем None вместо 0 для корректной работы связей (FK)
+            # Важно: записываем None вместо 0 для связей (Foreign Keys)
             resource_id=current_resource_id if current_resource_id != 0 else None,
             resource_type="product" if item.is_assembly else "component",
             is_resolved=item.is_resolved
@@ -70,10 +63,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 
 @router.get("/products")
 def get_all_products(db: Session = Depends(get_db)):
-    """
-    Получить список всех изделий.
-    Использует selectinload для быстрой подгрузки состава одним запросом.
-    """
+    """Получить список всех изделий с подгрузкой состава (BOM)."""
     return db.query(ProductType).options(
         selectinload(ProductType.components)
     ).all()
@@ -82,17 +72,17 @@ def get_all_products(db: Session = Depends(get_db)):
 @router.post("/setup-product")
 def setup_product(data: ProductCreateSchema, db: Session = Depends(get_db)):
     """
-    Создание изделия "с нуля" или загрузка полной структуры.
-    Обеспечивает атомарность: либо создается всё дерево, либо ничего.
+    Атомарная загрузка структуры изделия.
+    Либо создается все дерево с вложенными узлами, либо ничего.
     """
     try:
         product = create_product_recursive(data, db)
-        db.commit()  # Сохраняем все изменения в базе данных
-        db.refresh(product)  # Загружаем актуальное состояние (с ID и связями)
+        db.commit()
+        db.refresh(product)
         return product
     except Exception as e:
-        db.rollback()  # Отменяем всё, если произошла любая ошибка
-        print(f"Ошибка сохранения в БД: {e}")
+        db.rollback()
+        print(f"Ошибка сохранения структуры: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка при создании изделия: {str(e)}")
 
 
@@ -102,15 +92,12 @@ def process_manual_bom(
         items: List[BOMItemCreate],
         db: Session = Depends(get_db)
 ):
-    """
-    Добавление компонентов в уже существующее изделие
-    с автоматическим поиском аналогов на складе.
-    """
+    """Ручное добавление компонентов в существующий BOM через Legacy сервис."""
     if not items:
-        raise HTTPException(status_code=400, detail="Список компонентов пуст")
+        raise HTTPException(status_code=400, detail="Список пуст")
 
     raw_data = [item.dict() for item in items]
-    matching_service = BOMMatchingService(db)
+    matching_service = LegacyBOMService(db)
     processed_items = matching_service.process_bom_data(product_id, raw_data)
 
     return {
@@ -123,17 +110,14 @@ def process_manual_bom(
 @router.post("/products/{product_id}/resolve-bom")
 def resolve_bom(product_id: int, db: Session = Depends(get_db)):
     """
-    Интеллектуальное сопоставление BOM.
-
-    Запускает BOMMatchingService, который пытается автоматически найти
-    подходящие детали на складе для всех позиций в составе изделия.
+    Интеллектуальный запуск маппинга.
+    Связывает строки BOM с реальным складом (ТМЦ).
     """
+    # Локальный импорт внутри функции решает проблему циклической зависимости
     from app.services.matching_service import BOMMatchingService
 
-    # Вызываем логику сопоставления
     matched_count = BOMMatchingService.resolve_components(product_id, db)
 
-    # Если ничего не нашли, это не ошибка 404, а просто информационное сообщение
     return {
         "status": "success",
         "product_id": product_id,
