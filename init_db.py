@@ -1,5 +1,6 @@
 from app.database import engine, Base
 from app.models.inventory import Component, Stock
+from app.models.procurement import PurchaseOrder, PurchaseItem
 from app.models.production import ProductType, ProductBOM, Order, Reservation, Item
 
 
