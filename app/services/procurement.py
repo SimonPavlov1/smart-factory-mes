@@ -68,16 +68,20 @@ def update_purchase_delivery(
     tracking_code: str | None = None,
     arrival_date: date | None = None,
     invoice_ref: str | None = None,
-    status: str = "In Transit",
+    status: str | None = "In Transit",
 ) -> PurchaseOrder | None:
     purchase_order = db.get(PurchaseOrder, purchase_id)
     if not purchase_order:
         return None
 
-    purchase_order.status = status
-    purchase_order.tracking_code = tracking_code
-    purchase_order.arrival_date = arrival_date
-    purchase_order.invoice_ref = invoice_ref
+    if status is not None:
+        purchase_order.status = status
+    if tracking_code is not None:
+        purchase_order.tracking_code = tracking_code
+    if arrival_date is not None:
+        purchase_order.arrival_date = arrival_date
+    if invoice_ref is not None:
+        purchase_order.invoice_ref = invoice_ref
 
     db.commit()
     db.refresh(purchase_order)

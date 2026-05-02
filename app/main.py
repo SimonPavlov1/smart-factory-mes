@@ -3,6 +3,14 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.inventory import Component, Stock
 from app.models.production import ProductType, ProductBOM, Order
+from app.schemas.procurement import (
+    PurchaseDeliveryUpdate,
+    PurchaseOrderCreate,
+    PurchaseOrderDetail,
+    PurchaseOrderRead,
+    PurchaseReceiveRequest,
+)
+from app.services import procurement as procurement_service
 
 app = FastAPI(
     title="Smart Factory MES API",
@@ -23,15 +31,6 @@ def get_db():
 
 # --- 1. Inventory Management (Склад и НСИ) ---
 
-@app.post("/inventory")
-@app.post("/orders")
-def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
-    # Создаем запись в таблице заказов
-    new_order = Order(
-        product_id=payload.product_id,
-        target_qty=payload.target_qty,
-        status="Новый"
-    )
 @app.get("/components", tags=["Inventory"])
 def get_components(db: Session = Depends(get_db)):
     """
@@ -181,3 +180,126 @@ def start_production(order_id: int, db: Session = Depends(get_db)):
     order.status = "In Progress"
     db.commit()
     return {"message": "Order started, inventory deducted", "new_status": order.status}
+
+
+# --- 4. Procurement (Supply Management) ---
+
+def _purchase_order_detail(db: Session, purchase_id: int) -> dict:
+    purchase_order = procurement_service.get_purchase_order(db, purchase_id)
+    if not purchase_order:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    items = procurement_service.list_purchase_items(db, purchase_id)
+    return {
+        "id": purchase_order.id,
+        "supplier_name": purchase_order.supplier_name,
+        "status": purchase_order.status,
+        "invoice_ref": purchase_order.invoice_ref,
+        "tracking_code": purchase_order.tracking_code,
+        "arrival_date": purchase_order.arrival_date,
+        "items": items,
+    }
+
+
+@app.post(
+    "/procurement/orders",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PurchaseOrderDetail,
+    tags=["Procurement"],
+)
+def create_purchase_order(payload: PurchaseOrderCreate, db: Session = Depends(get_db)):
+    component_ids = {item.component_id for item in payload.items}
+    existing_components = (
+        db.query(Component.id)
+        .filter(Component.id.in_(component_ids))
+        .all()
+    )
+    existing_ids = {row[0] for row in existing_components}
+    missing_ids = sorted(component_ids - existing_ids)
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Components not found: {missing_ids}",
+        )
+
+    purchase_order = procurement_service.create_purchase_order(
+        db=db,
+        supplier_name=payload.supplier_name,
+        items=[item.model_dump() for item in payload.items],
+    )
+    return _purchase_order_detail(db, purchase_order.id)
+
+
+@app.get(
+    "/procurement/orders",
+    response_model=list[PurchaseOrderRead],
+    tags=["Procurement"],
+)
+def list_purchase_orders(
+    status: str | None = None,
+    supplier_name: str | None = None,
+    db: Session = Depends(get_db),
+):
+    return procurement_service.list_purchase_orders(
+        db=db,
+        status=status,
+        supplier_name=supplier_name,
+    )
+
+
+@app.get(
+    "/procurement/orders/{purchase_id}",
+    response_model=PurchaseOrderDetail,
+    tags=["Procurement"],
+)
+def get_purchase_order(purchase_id: int, db: Session = Depends(get_db)):
+    return _purchase_order_detail(db, purchase_id)
+
+
+@app.patch(
+    "/procurement/orders/{purchase_id}",
+    response_model=PurchaseOrderDetail,
+    tags=["Procurement"],
+)
+def update_purchase_order_delivery(
+    purchase_id: int,
+    payload: PurchaseDeliveryUpdate,
+    db: Session = Depends(get_db),
+):
+    purchase_order = procurement_service.update_purchase_delivery(
+        db=db,
+        purchase_id=purchase_id,
+        **payload.model_dump(exclude_unset=True),
+    )
+
+    if not purchase_order:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    return _purchase_order_detail(db, purchase_order.id)
+
+
+@app.post(
+    "/procurement/orders/{purchase_id}/receive",
+    response_model=PurchaseOrderDetail,
+    tags=["Procurement"],
+)
+def receive_purchase_order(
+    purchase_id: int,
+    payload: PurchaseReceiveRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    purchase_order = procurement_service.get_purchase_order(db, purchase_id)
+    if not purchase_order:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    if purchase_order.status == "Received":
+        raise HTTPException(status_code=400, detail="Purchase order already received")
+
+    receive_payload = payload or PurchaseReceiveRequest()
+    purchase_order = procurement_service.receive_purchase_order(
+        db=db,
+        purchase_id=purchase_id,
+        location=receive_payload.location,
+    )
+    return _purchase_order_detail(db, purchase_order.id)
