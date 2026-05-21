@@ -1,0 +1,9 @@
+.header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header-row:first-child {
+    margin-bottom: 10px;
+}
