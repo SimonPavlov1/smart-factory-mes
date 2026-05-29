@@ -15,7 +15,7 @@ export const RequestsPage = () => {
     const [isOpen, setIsOpen] = useState(false);
     const [productCount, setProductCount] = useState(0);
     const [priority, setPriority] = useState(0);
-    const [requests, setRequests] = useState([]);
+    const [requests, setRequests] = useState<RequestProps[]>([]);
 
     useEffect(() => {
         fetchWrapper("/api/requests")
@@ -95,7 +95,7 @@ export const RequestsPage = () => {
                         <InputLabel shrink sx={{ marginBottom: "6px" }}>
                             Дата поставки
                         </InputLabel>
-                        <DatePicker iconSide="right" variantColor="white" size="lg" />
+                        <DatePicker iconSide="right" variantColor="white" size="lg" label="Введите дату" format="DD.MM.YYYY" />
                     </FormControl>
                 </FormGroup>
 

@@ -27,7 +27,7 @@ const SIZES = {
     }
 }
 
-export const UserAvatar = ({ children, size = "md", ...props }: UserAvatarProps) => {
+export const UserAvatar = ({ children, size = "md", sx, ...props }: UserAvatarProps) => {
     const isChildrenString = typeof children === "string";
 
     return <Box sx={{
@@ -41,6 +41,8 @@ export const UserAvatar = ({ children, size = "md", ...props }: UserAvatarProps)
         fontWeight: 700,
         backgroundColor: isChildrenString ? "primary.main" : "",
         color: isChildrenString ? "#fff" : "",
+
+        ...sx
     }}
         {...props}>
         {children}

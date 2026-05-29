@@ -1,4 +1,13 @@
-export const getDate = (dateStr: string) => {
+import { MONTHS } from "@/consts";
+
+export const getFullMonthDateFormat = (dateStr: string) => {
     const date = new Date(dateStr);
-    return `${date.getDate()}.${date.getMonth()}.${date.getFullYear()}`
+    const day = date.getDate() < 10 ? `0${date.getDate()}` : date.getDate();
+    const month =  MONTHS[date.getMonth()];
+    
+    return `${day} ${month} ${date.getFullYear()}`
+}
+
+export const getLocalDateFormat = (dateStr: string) => {
+    return new Date(dateStr).toLocaleDateString("ru-RU");
 }

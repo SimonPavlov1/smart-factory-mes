@@ -3,7 +3,7 @@ import { Box, CircularProgress } from "@mui/material";
 import PriorityIcon from "@icons/priority.svg?react";
 import { ListItemWrapper } from "@ui/ListItemWrapper/ListItemWrapper";
 import type { RequestProps } from "@/models/request.model";
-import { getDate } from "@utils/date";
+import { getLocalDateFormat } from "@utils/date";
 import { PRIORITIES, STATUSES } from "@/consts";
 
 const PRIORITIES_CLASSES: { [key: number]: string } = {
@@ -40,11 +40,11 @@ export const RequestItem = ({ item }: { item: RequestProps }) => {
             </Box>
             <Box className="request-item__col">
                 <Box className="request-item__col-header">Дата создания</Box>
-                <Box className="request-item__col-content">{getDate(item.creationDate)}</Box>
+                <Box className="request-item__col-content">{getLocalDateFormat(item.creationDate)}</Box>
             </Box>
             <Box className="request-item__col">
                 <Box className="request-item__col-header">Дата поставки</Box>
-                <Box className="request-item__col-content">{getDate(item.deliveryDate)}</Box>
+                <Box className="request-item__col-content">{getLocalDateFormat(item.deliveryDate)}</Box>
             </Box>
             <Box className="request-item__col">
                 <Box className="request-item__col-header">Приоритет</Box>

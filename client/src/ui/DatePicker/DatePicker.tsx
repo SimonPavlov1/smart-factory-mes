@@ -23,14 +23,14 @@ const VARIANTS = {
 }
 
 export const DatePicker = ({ variantColor = "dark", iconSide = "left", size = "sm", sx, ...props }: CustomeDatePickerProps) => {
-    return <MuiDatePicker {...props} slots={{
+    return <MuiDatePicker label="Введите дату" format="dd, DD MMMM YYYY" {...props} slots={{
         openPickerIcon: CalendarIcon
     }} slotProps={{
         inputAdornment: {
             sx: {
                 margin: 0,
                 ...VARIANTS[iconSide]
-            }
+            },
         },
 
         openPickerButton: {
@@ -39,9 +39,30 @@ export const DatePicker = ({ variantColor = "dark", iconSide = "left", size = "s
                 height: "20px",
                 padding: 0,
             }
+        },
+
+        desktopPaper: {
+            sx: {
+                '& .MuiPickerDay-root': {
+                    fontSize: '1.6rem !important',
+                },
+
+                '& .MuiDayCalendar-weekDayLabel': {
+                    fontSize: '1.6rem',
+                },
+
+                '& .MuiPickersCalendarHeader-label': {
+                    fontSize: '1.6rem',
+                }
+            }
         }
     }} sx={{
         ...sx,
+
+        '& .MuiDialogContent-root *': {
+            fontSize: "1.6rem"
+        },
+
         "& .MuiPickersInputBase-root": {
             padding: size === "sm" ? "6px 16px" : "11px 17.5px",
             gap: "24px",
@@ -49,15 +70,36 @@ export const DatePicker = ({ variantColor = "dark", iconSide = "left", size = "s
             border: "none",
             fontSize: "1.6rem",
             color: "#0A1629",
-            ...VARIANTS[variantColor]
+            ...VARIANTS[variantColor],
+
+            '&.Mui-focused .MuiPickersSectionList-root': {
+                opacity: 0
+            }
         },
+
         "& .MuiPickersSectionList-root": {
             width: "fit-content",
             padding: 0,
-            justifyContent: iconSide === "left" ? "flex-end" : "flex-start"
+            justifyContent: iconSide === "left" ? "flex-end" : "flex-start",
         },
+
         "& .MuiPickersOutlinedInput-notchedOutline": {
             border: 0
         },
+
+        "& .MuiFormLabel-root": {
+            position: 'absolute',
+            top: "50%",
+            left: iconSide === "left" ? "55%" : "17px",
+            transform: "translateY(-50%)",
+            fontSize: '1.32rem',
+            fontWeight: 400,
+            pointerEvents: 'none',
+            color: "grey.900",
+
+            '&.MuiFormLabel-filled': {
+                opacity: 0
+            },
+        }
     }} />
 }

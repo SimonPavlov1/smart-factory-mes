@@ -1,12 +1,18 @@
-import { List } from "@mui/material"
-import { ActivityItem } from "./ui/ActivityItem"
-import { useEffect } from "react"
+import { List } from "@mui/material";
+import { ActivityItem } from "./ui/ActivityItem";
+import { useEffect, useState } from "react";
+import type { ActivityProps } from "@models/activity.model";
+import { fetchWrapper } from "@apis/webApi";
 
 export const ActivitiesList = () => {
+    const [activities, setActivities] = useState([]);
     useEffect(() => {
-        // запрос активностей
-    })
+        fetchWrapper("/api/activities")
+        .then((response) => {
+            setActivities(response);
+        })
+    }, [])
     return <List>
-        <ActivityItem />
+        {activities.length === 0 ? null : activities.map((item: ActivityProps) => <ActivityItem item={item} key={item.author + item.id} />)}
     </List>
 }
