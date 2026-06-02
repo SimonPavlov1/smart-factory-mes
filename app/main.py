@@ -20,7 +20,7 @@ app = FastAPI(
 # Необходима, чтобы твой фронтенд (например, на React/Vite) мог делать запросы к бэкенду.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Адрес, на котором обычно запущен фронтенд
+    allow_origins=["http://localhost:5174"], # Адрес, на котором обычно запущен фронтенд
     allow_credentials=True,
     allow_methods=["*"],  # Разрешаем все типы запросов (GET, POST, DELETE и др.)
     allow_headers=["*"],  # Разрешаем любые HTTP-заголовки
