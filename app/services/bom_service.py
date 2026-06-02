@@ -84,7 +84,11 @@ class BOMMatchingService:
     def process_bom_data(self, product_id: int, extracted_rows: List[Dict]) -> List[ProductBOM]:
         bom_items = []
         for row in extracted_rows:
-            design_name = row.get("name", "").strip()
+            # ИСПРАВЛЕНО: Сначала пытаемся взять 'design_name' (как шлет фронтенд),
+            # если его нет — берем 'name' (для обратной совместимости с парсером файлов)
+            design_name = row.get("design_name") or row.get("name") or ""
+            design_name = design_name.strip()
+
             designators = row.get("designators", "")
             quantity = row.get("quantity", 0)
 
@@ -93,20 +97,33 @@ class BOMMatchingService:
                 self.current_category = design_name
                 continue
 
+            # Если имя строки оказалось совсем пустым, не плодим призраков
+            if not design_name:
+                continue
+
+            # Пытаемся найти автоподбором на складе
             component_id = self._find_best_match(design_name)
 
+            # Получаем тип ресурса, который прислал фронтенд (опционально)
+            incoming_resource_type = row.get("resource_type", "raw_string")
+
+            # Формируем запись для базы данных спецификации
             bom_item = ProductBOM(
                 product_id=product_id,
-                design_name=design_name,
+                design_name=design_name,  # ИМЯ ТЕПЕРЬ СОХРАНИТСЯ НАВСЕГДА!
                 designators=designators,
                 quantity=float(quantity),
-                resource_id=component_id,
-                resource_type="component",
+                resource_id=component_id,  # ID склада привяжется, только если find_best_match его нашел
+
+                # Если компонент успешно сопоставлен со складом — пишем 'component'.
+                # Если совпадений нет — сохраняем тот тип, который передал фронтенд ('raw_string')
+                resource_type="component" if component_id else incoming_resource_type,
                 is_resolved=True if component_id else False
             )
             self.db.add(bom_item)
             bom_items.append(bom_item)
 
+            # Если складской аналог не найден, фиксируем строку в таблице неразрешенных маппингов
             if not component_id:
                 self._ensure_mapping_exists(design_name)
 
