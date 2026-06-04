@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+
 from app.database import get_db
 from app.models.inventory import Component, Stock
 from app.schemas.inventory import ComponentCreate
@@ -8,24 +10,16 @@ from app.schemas.inventory import ComponentCreate
 router = APIRouter(tags=["Склад (Inventory)"])
 
 
-@router.post("/components", response_model=None)
+@router.post("/components")
 def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
-    """
-    Регистрация новой позиции в справочнике ТМЦ.
-
-    Этот метод создает "паспорт" детали. Здесь мы используем поле specifications (JSON),
-    чтобы сохранить уникальные свойства (например, для микросхем — интерфейсы,
-    для резисторов — точность).
-    """
-    # Проверка на дубликаты по MPN (артикулу производителя)
+    """Регистрация нового компонента в справочнике."""
     existing = db.query(Component).filter(Component.part_number == data.part_number).first()
     if existing:
         raise HTTPException(
             status_code=400,
-            detail=f"Компонент с артикулом {data.part_number} уже существует в базе"
+            detail=f"Компонент с артикулом {data.part_number} уже существует"
         )
 
-    # Создание записи с поддержкой гибких полей
     new_component = Component(
         name=data.name,
         part_number=data.part_number,
@@ -34,7 +28,7 @@ def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
         value=data.value,
         value_numeric=data.value_numeric,
         voltage=data.voltage,
-        specifications=data.specifications  # SQLAlchemy сама упакует dict в JSON
+        specifications=data.specifications
     )
 
     db.add(new_component)
@@ -44,17 +38,49 @@ def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/components")
-def get_components(db: Session = Depends(get_db)):
-    """
-    Получить весь список зарегистрированных компонентов.
-    Нужен для проверки, какие ID присвоены вашим деталям.
-    """
-    return db.query(Component).all()
+def get_components(search: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    """Получение списка компонентов с фильтрацией по поисковому запросу."""
+    query = db.query(Component)
+
+    if search and search.strip():
+        search_words = search.strip().split()
+        conditions = []
+        for word in search_words:
+            pattern = f"%{word}%"
+            conditions.append(or_(
+                Component.name.ilike(pattern),
+                Component.category.ilike(pattern),
+                Component.package.ilike(pattern),
+                Component.value.ilike(pattern),
+                Component.part_number.ilike(pattern)
+            ))
+        query = query.filter(and_(*conditions))
+
+    components = query.all()
+    stock_map = {s.component_id: s.actual_qty for s in db.query(Stock).all()}
+
+    return [
+        {
+            **comp.__dict__,
+            "category": comp.category or "Прочие компоненты",
+            "quantity": stock_map.get(comp.id, 0.0)
+        }
+        for comp in components
+    ]
+
+
+@router.get("/components/categories", response_model=List[str])
+def get_unique_categories(db: Session = Depends(get_db)):
+    """Получение списка всех уникальных категорий."""
+    categories = db.query(Component.category).distinct().all()
+    result = [cat[0] for cat in categories if cat[0]]
+
+    return sorted(result) if result else ["Резисторы", "Конденсаторы", "Микросхемы", "Прочее"]
 
 
 @router.get("/components/{component_id}")
 def get_component_by_id(component_id: int, db: Session = Depends(get_db)):
-    """Получить подробную карточку компонента, включая его JSON-характеристики."""
+    """Получение подробной карточки компонента по ID."""
     component = db.query(Component).get(component_id)
     if not component:
         raise HTTPException(status_code=404, detail="Компонент не найден")
@@ -63,38 +89,61 @@ def get_component_by_id(component_id: int, db: Session = Depends(get_db)):
 
 @router.post("/incoming")
 def add_stock(component_id: int, quantity: float, location: str = "Warehouse-1", db: Session = Depends(get_db)):
-    """
-    Оприходование (приемка) ТМЦ на физический склад.
-
-    Сначала проверяет наличие 'паспорта' в справочнике. Если карточка есть,
-    создает или обновляет запись в таблице Stock (остатки).
-    """
-    # Защита: нельзя положить на склад то, чего нет в справочнике компонентов
-    component_exists = db.query(Component).get(component_id)
-    if not component_exists:
-        raise HTTPException(
-            status_code=404,
-            detail="Сначала создайте карточку компонента через /components, чтобы получить ID"
-        )
+    """Оприходование количества компонента на склад."""
+    if not db.query(Component).get(component_id):
+        raise HTTPException(status_code=404, detail="Компонент не найден")
 
     stock_item = db.query(Stock).filter(Stock.component_id == component_id).first()
 
     if stock_item:
-        # Если деталь уже лежит на этом складе — плюсуем количество
         stock_item.actual_qty += quantity
         stock_item.location = location
     else:
-        # Если приехала впервые — создаем запись об остатке
-        stock_item = Stock(
-            component_id=component_id,
-            actual_qty=quantity,
-            location=location
-        )
+        stock_item = Stock(component_id=component_id, actual_qty=quantity, location=location)
         db.add(stock_item)
 
     db.commit()
-    return {
-        "status": "success",
-        "component": component_exists.part_number,
-        "new_qty": stock_item.actual_qty
-    }
+    return {"status": "success", "new_qty": stock_item.actual_qty}
+
+
+@router.put("/components/{component_id}")
+def update_component(component_id: int, data: ComponentCreate, db: Session = Depends(get_db)):
+    """Обновление данных существующего компонента."""
+    component = db.query(Component).get(component_id)
+    if not component:
+        raise HTTPException(status_code=404, detail="Компонент не найден")
+
+    for key, value in data.dict().items():
+        setattr(component, key, value)
+
+    db.commit()
+    db.refresh(component)
+    return {"status": "success", "component": component}
+
+
+@router.delete("/components/{component_id}")
+def delete_component(component_id: int, db: Session = Depends(get_db)):
+    """Удаление компонента и связанных с ним остатков."""
+    component = db.query(Component).get(component_id)
+    if not component:
+        raise HTTPException(status_code=404, detail="Компонент не найден")
+
+    db.query(Stock).filter(Stock.component_id == component_id).delete()
+    db.delete(component)
+    db.commit()
+
+    return {"status": "success", "message": "Компонент удален"}
+
+
+@router.patch("/components/{component_id}/quantity")
+def update_stock_quantity(component_id: int, new_quantity: float, db: Session = Depends(get_db)):
+    """Прямое обновление количества компонента на складе."""
+    stock = db.query(Stock).filter(Stock.component_id == component_id).first()
+    if not stock:
+        stock = Stock(component_id=component_id, actual_qty=new_quantity)
+        db.add(stock)
+    else:
+        stock.actual_qty = new_quantity
+
+    db.commit()
+    return {"status": "success", "new_qty": stock.actual_qty}
