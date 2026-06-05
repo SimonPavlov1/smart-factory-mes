@@ -23,6 +23,15 @@ class BOMItemUpdate(BaseModel):
     is_resolved: Optional[bool] = False
 
 
+class BOMManualItemSchema(BaseModel):
+    design_name: str
+    quantity: float
+    designators: Optional[str] = None
+    resource_id: Optional[int] = None
+    resource_type: Optional[str] = "raw_string"
+    is_resolved: Optional[bool] = False
+
+
 class ProductUpdate(BaseModel):
     name: str
     drawing_number: Optional[str] = None
@@ -33,11 +42,13 @@ class ProductUpdate(BaseModel):
 
 def create_product_recursive(data: ProductCreateSchema, db: Session):
     """Рекурсивное создание структуры изделия."""
+    is_subassembly = not data.is_final
+
     new_product = ProductType(
         name=data.name,
         drawing_number=data.drawing_number,
         revision=data.version,
-        is_subassembly=not data.is_final
+        is_subassembly=is_subassembly
     )
     db.add(new_product)
     db.flush()
@@ -61,7 +72,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
             design_name=item.design_name,
             quantity=item.quantity,
             resource_id=current_id if current_id != 0 else None,
-            resource_type="product" if item.is_assembly else "component",
+            resource_type="subassembly" if item.is_assembly else "component",
             is_resolved=item.is_resolved
         )
         db.add(bom_entry)
@@ -88,12 +99,14 @@ def get_all_products(db: Session = Depends(get_db)):
             }
             section = "Непривязанные компоненты"
 
-            if item.resource_type == "component" or (item.resource_id in warehouse_cache):
+            # СТРОГАЯ ПРОВЕРКА: Если тип "component", смотрим ТОЛЬКО на склад
+            if item.resource_type == "component":
                 comp = warehouse_cache.get(item.resource_id)
                 if comp:
                     item_data["resource"] = {"id": comp.id, "name": comp.name, "part_number": comp.part_number}
                     section = getattr(comp, "category", "Прочие складские компоненты")
 
+            # Если тип узел/изделие, смотрим ТОЛЬКО в каталог изделий
             elif item.resource_type in ["product", "subassembly"]:
                 section = "Сборочные единицы (Узлы)"
                 sub_prod = products_cache.get(item.resource_id)
@@ -107,8 +120,12 @@ def get_all_products(db: Session = Depends(get_db)):
         sections.sort(key=lambda x: (x["name"] == "Непривязанные компоненты", x["name"]))
 
         result.append({
-            "id": product.id, "name": product.name, "drawing_number": product.drawing_number,
-            "revision": product.revision, "sections": sections
+            "id": product.id,
+            "name": product.name,
+            "drawing_number": product.drawing_number,
+            "revision": product.revision,
+            "is_subassembly": product.is_subassembly,
+            "sections": sections
         })
     return result
 
@@ -126,11 +143,46 @@ def setup_product(data: ProductCreateSchema, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/process-bom/{product_id}", response_model=BOMUploadResponse)
-def process_manual_bom(product_id: int, items: List[BOMItemCreate], db: Session = Depends(get_db)):
-    """Ручное добавление позиций в спецификацию."""
-    processed = BOMMatchingService(db).process_bom_data(product_id, [i.dict() for i in items])
-    return {"product_id": product_id, "total_items": len(processed), "items": processed}
+@router.post("/process-bom/{product_id}")
+def process_manual_bom(product_id: int, items: List[BOMManualItemSchema], db: Session = Depends(get_db)):
+    """Ручное добавление позиций в спецификацию с поддержкой готовых сборочных единиц."""
+    processed_items = []
+    items_to_match = []
+
+    for item in items:
+        # Если фронтенд передает уже готовую сборочную единицу или привязанный объект
+        if item.resource_id is not None and item.resource_type in ["product", "subassembly", "component"]:
+            bom_entry = ProductBOM(
+                product_id=product_id,
+                design_name=item.design_name.strip(),
+                quantity=item.quantity,
+                designators=item.designators.strip() if item.designators else None,
+                resource_id=item.resource_id,
+                resource_type=item.resource_type,
+                is_resolved=True
+            )
+            db.add(bom_entry)
+            db.flush()  # Генерируем ID для записи
+
+            processed_items.append({
+                "id": bom_entry.id,
+                "design_name": bom_entry.design_name,
+                "quantity": bom_entry.quantity,
+                "designators": bom_entry.designators,
+                "resource_id": bom_entry.resource_id,
+                "resource_type": bom_entry.resource_type,
+                "is_resolved": bom_entry.is_resolved
+            })
+        else:
+            # Иначе отправляем строку на стандартный парсинг и умный поиск по складу
+            items_to_match.append(item.dict())
+
+    if items_to_match:
+        matched = BOMMatchingService(db).process_bom_data(product_id, items_to_match)
+        processed_items.extend(matched)
+
+    db.commit()
+    return {"product_id": product_id, "total_items": len(processed_items), "items": processed_items}
 
 
 @router.post("/products/{product_id}/resolve-bom")
@@ -142,27 +194,44 @@ def resolve_bom(product_id: int, db: Session = Depends(get_db)):
 
 @router.put("/bom-items/{item_id}")
 def update_bom_item(item_id: int, data: BOMItemUpdate, db: Session = Depends(get_db)):
-    """Обновление строки спецификации."""
+    """Обновление строки спецификации и гибкое переопределение её привязки."""
     item = db.query(ProductBOM).get(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
 
+    # 1. Обновляем базовые текстовые и числовые поля
     item.design_name = data.design_name.strip()
     item.quantity = data.quantity
     item.designators = data.designators.strip() if data.designators else None
 
-    if data.resource_id is not None:
-        item.resource_id, item.resource_type, item.is_resolved = data.resource_id, data.resource_type, True
-    elif item.design_name != data.design_name:
-        item.resource_id, item.resource_type, item.is_resolved = None, "raw_string", False
+    # 2. Логика переопределения привязки (Проверяем, что прислал фронтенд)
+    if data.resource_id is not None and data.resource_id != 0:
+        # Если передан конкретный ID, жестко связываем с ним (неважно, компонент это или узел)
+        item.resource_id = data.resource_id
+        item.resource_type = data.resource_type if data.resource_type != "raw_string" else "component"
+        item.is_resolved = True
+    else:
+        # Если фронтенд прислал null, 0 или явно флаг снятия привязки
+        item.resource_id = None
+        item.resource_type = "raw_string"
+        item.is_resolved = False
 
     db.commit()
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "detail": "Позиция успешно переопределена",
+        "item": {
+            "id": item.id,
+            "resource_id": item.resource_id,
+            "resource_type": item.resource_type,
+            "is_resolved": item.is_resolved
+        }
+    }
 
 
 @router.delete("/products/{product_id}")
 def delete_product(product_id: int, db: Session = Depends(get_db)):
-    """Каскадное удаление изделия и всех его связей."""
+    """Каскадное удаление изделия и всех его связей из каталога."""
     product = db.query(ProductType).get(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Изделие не найдено")
@@ -173,3 +242,15 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     db.delete(product)
     db.commit()
     return {"status": "success"}
+
+
+@router.delete("/bom-items/{item_id}")
+def delete_bom_item(item_id: int, db: Session = Depends(get_db)):
+    """Удаление конкретного компонента или узла из состава изделия (строки спецификации)."""
+    item = db.query(ProductBOM).get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция в спецификации не найдена")
+
+    db.delete(item)
+    db.commit()
+    return {"status": "success", "detail": "Компонент успешно удален из состава"}
