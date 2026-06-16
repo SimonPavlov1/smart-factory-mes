@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import engine, Base
-from app.api import inventory, production, procurement
+from app.api import inventory, production, procurement, manufacturing
 
 # Создаем все таблицы в базе данных на основе наших моделей.
 # Если база данных пуста или файла sql_app.db нет, он будет создан автоматически.
@@ -31,6 +31,7 @@ app.add_middleware(
 app.include_router(inventory.router, prefix="/inventory", tags=["Склад (Inventory)"])
 app.include_router(production.router, prefix="/production", tags=["Производство (Production)"])
 app.include_router(procurement.router, prefix="/procurement", tags=["Закупки (Procurement)"])
+app.include_router(manufacturing.router)
 
 @app.get("/", tags=["Системные"])
 def read_root():

@@ -52,3 +52,4 @@ class Stock(Base):
     location = Column(String, default="Warehouse-1", comment="Адрес хранения (стеллаж, ячейка)")
 
     component = relationship("Component", back_populates="stock")
+    reserved_qty = Column(Float, default=0.0)
