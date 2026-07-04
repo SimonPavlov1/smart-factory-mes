@@ -48,7 +48,9 @@ class ProductType(Base):
 
     # Связи
     components = relationship("ProductBOM", back_populates="product", cascade="all, delete-orphan")
-    orders = relationship("Order", back_populates="product_type")
+
+    # Связь с позициями заказов, где фигурирует данное изделие
+    order_items = relationship("OrderItem", back_populates="product")
 
 
 class ProductBOM(Base):
@@ -99,18 +101,39 @@ class ProductBOM(Base):
 class Order(Base):
     """
     Заказ на производство (Производственное задание).
-    Фиксирует намерение собрать X единиц определенного изделия.
+    Хранит общую информацию: заказчик, статус выполнения проекта и дату.
+    Содержит в себе вложенный список изделий и объемов через таблицу OrderItem.
     """
     __tablename__ = "orders"
     id = Column(Integer, primary_key=True, index=True)
-    product_id = Column(Integer, ForeignKey("product_types.id"), nullable=False)
-    target_qty = Column(Integer, nullable=False, comment="План выпуска (штук).")
-    status = Column(String, default="New", index=True, comment="Этап: New -> In Progress -> Completed.")
+    customer_name = Column(String, nullable=False, comment="Наименование заказчика / контрагента.")
+    status = Column(String, default="In Progress", index=True,
+                    comment="Этап: In Progress -> In Production -> Completed.")
     created_at = Column(DateTime, server_default=func.now(), comment="Время постановки в очередь.")
 
-    product_type = relationship("ProductType", back_populates="orders")
+    # Связи
+    # lazy="joined" автоматически подгружает список позиций при базовом запросе к заказу
+    items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan", lazy="joined")
     reservations = relationship("Reservation", back_populates="order")
-    items = relationship("Item", back_populates="order")
+    items_sn = relationship("Item", back_populates="order")
+
+
+class OrderItem(Base):
+    """
+    Позиции производственного заказа.
+    Связывает один комплексный заказ с несколькими позициями каталога изделий (ProductType).
+    """
+    __tablename__ = "order_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False,
+                      comment="Ссылка на главный заказ")
+    product_id = Column(Integer, ForeignKey("product_types.id"), nullable=False, comment="Ссылка на собираемое изделие")
+    quantity = Column(Integer, nullable=False, default=1, comment="План выпуска данного изделия (штук).")
+
+    # Обратные связи
+    order = relationship("Order", back_populates="items")
+    product = relationship("ProductType", back_populates="order_items")
 
 
 class Reservation(Base):
@@ -138,4 +161,4 @@ class Item(Base):
     serial_number = Column(String, unique=True, index=True, nullable=False, comment="SN изделия.")
     test_result = Column(String, nullable=True, comment="Результат прохождения ОТК.")
 
-    order = relationship("Order", back_populates="items")
+    order = relationship("Order", back_populates="items_sn")

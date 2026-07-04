@@ -1,5 +1,51 @@
 from pydantic import BaseModel
+from datetime import datetime
+from typing import List, Optional
+
+# --- Схемы для ОТОБРАЖЕНИЯ (Out) ---
+
+class ProductMinOut(BaseModel):
+    """Минимальная информация об изделии для отображения в составе заказа"""
+    id: int
+    name: str
+    sku: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OrderItemOut(BaseModel):
+    """Позиция заказа при выдаче на фронтенд"""
+    id: int
+    product_id: int
+    quantity: int
+    product: ProductMinOut  # Наша магия: вкладываем сюда объект с именем и артикулом
+
+    class Config:
+        from_attributes = True
+
+
+class OrderOut(BaseModel):
+    """Схема самого заказа со всем списком его позиций"""
+    id: int
+    customer_name: str
+    status: str
+    created_at: datetime
+    items: List[OrderItemOut]  # Список позиций
+
+    class Config:
+        from_attributes = True
+
+
+# --- Схемы для СОЗДАНИЯ (Create) ---
+
+class OrderItemCreate(BaseModel):
+    """Схема для добавления одной позиции при создании заказа"""
+    product_id: int
+    quantity: int
+
 
 class OrderCreate(BaseModel):
-    product_id: int    # ID изделия, которое хотим собрать (например, 1)
-    target_qty: int    # Сколько штук хотим сделать (например, 10)
+    """Схема, которую присылает фронтенд при создании нового заказа"""
+    customer_name: str
+    items: List[OrderItemCreate]
