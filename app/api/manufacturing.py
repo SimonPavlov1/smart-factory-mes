@@ -170,25 +170,19 @@ def get_order_bom_summary(order_id: int, db: Session = Depends(get_db)):
                     total_needed_items[c_id] = {"qty": material["qty"]}
 
     # Обогащаем данные информацией из таблицы Component с защитой от отсутствия полей
-    result = []
-    for c_id, info in total_needed_items.items():
-        component = db.query(Component).filter(Component.id == c_id).first()
+        result = []
+        for c_id, info in total_needed_items.items():
+            component = db.query(Component).filter(Component.id == c_id).first()
+            category = component.category if component and component.category else "Прочее"
 
-        # Динамически ищем поле артикула, чтобы избежать AttributeError
-        component_sku = "—"
-        if component:
-            if hasattr(component, "sku") and component.sku:
-                component_sku = component.sku
-            elif hasattr(component, "part_number") and component.part_number:
-                component_sku = component.part_number
-            elif hasattr(component, "code") and component.code:
-                component_sku = component.code
-
-        result.append({
-            "id": c_id,
-            "name": component.name if component else f"Компонент ID {c_id}",
-            "sku": component_sku,
-            "qty": info["qty"]
-        })
+            result.append({
+                "id": c_id,
+                "name": component.name if component else f"Компонент ID {c_id}",
+                "sku": component.part_number if component else "—",
+                "qty": info["qty"],
+                "device": "Готовое изделие",
+                "assembly": "Основной состав",
+                "category": category
+            })
 
     return result
