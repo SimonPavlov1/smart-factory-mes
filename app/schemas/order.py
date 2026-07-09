@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import List, Optional
 
@@ -41,11 +41,11 @@ class OrderOut(BaseModel):
 
 class OrderItemCreate(BaseModel):
     """Схема для добавления одной позиции при создании заказа"""
-    product_id: int
-    quantity: int
+    product_id: int = Field(gt=0)
+    quantity: int = Field(gt=0)
 
 
 class OrderCreate(BaseModel):
     """Схема, которую присылает фронтенд при создании нового заказа"""
-    customer_name: str
+    customer_name: str = Field(min_length=1)
     items: List[OrderItemCreate]

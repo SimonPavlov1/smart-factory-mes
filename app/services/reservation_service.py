@@ -15,6 +15,9 @@ def reserve_components(db: Session, items: list):
         if not stock:
             raise HTTPException(status_code=404, detail=f"Компонент {item['component_id']} отсутствует на складе")
 
+        stock.actual_qty = stock.actual_qty or 0
+        stock.reserved_qty = stock.reserved_qty or 0
+
         # Считаем доступный остаток (то, что есть минус то, что уже обещано)
         available = stock.actual_qty - stock.reserved_qty
 
