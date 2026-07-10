@@ -1,13 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import engine, Base
-from app.api import inventory, production, procurement, manufacturing
+from app.database import engine, Base, SessionLocal
+from app.api import auth, inventory, production, procurement, manufacturing
+from app.services.auth_service import ensure_default_admin
 
 # Создаем все таблицы в базе данных на основе наших моделей.
 # Если база данных пуста или файла sql_app.db нет, он будет создан автоматически.
 # В продакшене обычно используются миграции (Alembic), но для текущего этапа это идеальный вариант.
 Base.metadata.create_all(bind=engine)
+with SessionLocal() as db:
+    ensure_default_admin(db)
 
 # Инициализируем FastAPI с метаданными для Swagger-документации.
 app = FastAPI(
@@ -32,6 +35,7 @@ app.include_router(inventory.router, prefix="/inventory", tags=["Склад (Inv
 app.include_router(production.router, prefix="/production", tags=["Производство (Production)"])
 app.include_router(procurement.router, prefix="/procurement", tags=["Закупки (Procurement)"])
 app.include_router(manufacturing.router)
+app.include_router(auth.router)
 
 @app.get("/", tags=["Системные"])
 def read_root():

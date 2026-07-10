@@ -6,6 +6,7 @@ from typing import List, Optional
 from app.database import get_db
 from app.models.inventory import Component, Stock
 from app.schemas.inventory import ComponentCreate
+from app.services.auth_service import require_roles
 
 router = APIRouter(tags=["Склад (Inventory)"])
 
@@ -43,7 +44,11 @@ def _apply_component_search(query, search: Optional[str]):
 
 
 @router.post("/components")
-def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
+def create_component(
+    data: ComponentCreate,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """Регистрация нового компонента в справочнике."""
     existing = db.query(Component).filter(Component.part_number == data.part_number).first()
     if existing:
@@ -74,7 +79,8 @@ def get_components(
     search: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
 ):
     """Получение списка компонентов с фильтрацией по поисковому запросу."""
     query = _apply_component_search(db.query(Component), search)
@@ -92,7 +98,8 @@ def get_components(
 def search_components(
     q: str = Query("", description="Поиск по названию, артикулу, категории, корпусу или номиналу"),
     limit: int = Query(25, ge=1, le=100),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
 ):
     """Короткий поиск компонентов для dropdown-подбора BOM без загрузки всего склада."""
     query = _apply_component_search(db.query(Component), q)
@@ -107,7 +114,10 @@ def search_components(
 
 
 @router.get("/components/categories", response_model=List[str])
-def get_unique_categories(db: Session = Depends(get_db)):
+def get_unique_categories(
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+):
     """Получение списка всех уникальных категорий."""
     categories = db.query(Component.category).distinct().all()
     result = [cat[0] for cat in categories if cat[0]]
@@ -116,7 +126,11 @@ def get_unique_categories(db: Session = Depends(get_db)):
 
 
 @router.get("/components/{component_id}")
-def get_component_by_id(component_id: int, db: Session = Depends(get_db)):
+def get_component_by_id(
+    component_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+):
     """Получение подробной карточки компонента по ID."""
     component = db.query(Component).get(component_id)
     if not component:
@@ -125,7 +139,13 @@ def get_component_by_id(component_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/incoming")
-def add_stock(component_id: int, quantity: float, location: str = "Warehouse-1", db: Session = Depends(get_db)):
+def add_stock(
+    component_id: int,
+    quantity: float,
+    location: str = "Warehouse-1",
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """Оприходование количества компонента на склад."""
     if not db.query(Component).get(component_id):
         raise HTTPException(status_code=404, detail="Компонент не найден")
@@ -144,7 +164,12 @@ def add_stock(component_id: int, quantity: float, location: str = "Warehouse-1",
 
 
 @router.put("/components/{component_id}")
-def update_component(component_id: int, data: ComponentCreate, db: Session = Depends(get_db)):
+def update_component(
+    component_id: int,
+    data: ComponentCreate,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """Обновление данных существующего компонента."""
     component = db.query(Component).get(component_id)
     if not component:
@@ -159,7 +184,11 @@ def update_component(component_id: int, data: ComponentCreate, db: Session = Dep
 
 
 @router.delete("/components/{component_id}")
-def delete_component(component_id: int, db: Session = Depends(get_db)):
+def delete_component(
+    component_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """Удаление компонента и связанных с ним остатков."""
     component = db.query(Component).get(component_id)
     if not component:
@@ -173,7 +202,12 @@ def delete_component(component_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/components/{component_id}/quantity")
-def update_stock_quantity(component_id: int, new_quantity: float, db: Session = Depends(get_db)):
+def update_stock_quantity(
+    component_id: int,
+    new_quantity: float,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """Прямое обновление количества компонента на складе."""
     stock = db.query(Stock).filter(Stock.component_id == component_id).first()
     if not stock:

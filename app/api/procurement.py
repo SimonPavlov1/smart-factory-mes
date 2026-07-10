@@ -3,11 +3,16 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.procurement import PurchaseOrder, PurchaseItem
 from app.models.inventory import Stock
+from app.services.auth_service import require_roles
 
 router = APIRouter(tags=["Закупки (Procurement)"])
 
 @router.post("/orders")
-def create_purchase_order(supplier: str, db: Session = Depends(get_db)):
+def create_purchase_order(
+    supplier: str,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager")),
+):
     """Создать новый черновик заказа поставщику."""
     new_order = PurchaseOrder(supplier_name=supplier, status="Draft")
     db.add(new_order)
@@ -16,7 +21,11 @@ def create_purchase_order(supplier: str, db: Session = Depends(get_db)):
     return new_order
 
 @router.post("/orders/{order_id}/receive")
-def receive_order(order_id: int, db: Session = Depends(get_db)):
+def receive_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """
     Финальная приемка заказа.
     Переводит статус в 'Received' и автоматически пополняет остатки на складе.

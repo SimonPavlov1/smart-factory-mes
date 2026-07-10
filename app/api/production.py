@@ -8,6 +8,7 @@ from app.models.production import ProductType, ProductBOM, BOMMapping
 from app.models.inventory import Component
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
 from app.services.bom_service import BOMMatchingService
+from app.services.auth_service import require_roles
 
 router = APIRouter(tags=["Производство (Production)"])
 
@@ -83,7 +84,10 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 # --- Эндпоинты ---
 
 @router.get("/products")
-def get_all_products(db: Session = Depends(get_db)):
+def get_all_products(
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer", "manager", "production", "warehouse")),
+):
     """Получение всех изделий с группировкой по категориям компонентов."""
     products = db.query(ProductType).options(selectinload(ProductType.components)).all()
     warehouse_cache = {c.id: c for c in db.query(Component).all()}
@@ -131,7 +135,11 @@ def get_all_products(db: Session = Depends(get_db)):
 
 
 @router.post("/setup-product")
-def setup_product(data: ProductCreateSchema, db: Session = Depends(get_db)):
+def setup_product(
+    data: ProductCreateSchema,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Атомарная загрузка структуры изделия."""
     try:
         product = create_product_recursive(data, db)
@@ -144,7 +152,12 @@ def setup_product(data: ProductCreateSchema, db: Session = Depends(get_db)):
 
 
 @router.post("/process-bom/{product_id}")
-def process_manual_bom(product_id: int, items: List[BOMManualItemSchema], db: Session = Depends(get_db)):
+def process_manual_bom(
+    product_id: int,
+    items: List[BOMManualItemSchema],
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Ручное добавление позиций в спецификацию с поддержкой готовых сборочных единиц."""
     processed_items = []
     items_to_match = []
@@ -186,14 +199,22 @@ def process_manual_bom(product_id: int, items: List[BOMManualItemSchema], db: Se
 
 
 @router.post("/products/{product_id}/resolve-bom")
-def resolve_bom(product_id: int, db: Session = Depends(get_db)):
+def resolve_bom(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Автоматическая привязка компонентов (умный подбор)."""
     count = BOMMatchingService.resolve_components(product_id, db)
     return {"status": "success", "matched_items": count}
 
 
 @router.get("/bom-items/{item_id}/match-candidates")
-def get_bom_match_candidates(item_id: int, db: Session = Depends(get_db)):
+def get_bom_match_candidates(
+    item_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Возвращает кандидатов для ручной привязки строки BOM к складскому компоненту."""
     item = db.query(ProductBOM).get(item_id)
     if not item:
@@ -204,7 +225,12 @@ def get_bom_match_candidates(item_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/bom-items/{item_id}")
-def update_bom_item(item_id: int, data: BOMItemUpdate, db: Session = Depends(get_db)):
+def update_bom_item(
+    item_id: int,
+    data: BOMItemUpdate,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Обновление строки спецификации и гибкое переопределение её привязки."""
     item = db.query(ProductBOM).get(item_id)
     if not item:
@@ -250,7 +276,11 @@ def update_bom_item(item_id: int, data: BOMItemUpdate, db: Session = Depends(get
 
 
 @router.delete("/products/{product_id}")
-def delete_product(product_id: int, db: Session = Depends(get_db)):
+def delete_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Каскадное удаление изделия и всех его связей из каталога."""
     product = db.query(ProductType).get(product_id)
     if not product:
@@ -265,7 +295,11 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/bom-items/{item_id}")
-def delete_bom_item(item_id: int, db: Session = Depends(get_db)):
+def delete_bom_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
     """Удаление конкретного компонента или узла из состава изделия (строки спецификации)."""
     item = db.query(ProductBOM).get(item_id)
     if not item:

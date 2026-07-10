@@ -7,6 +7,7 @@ from app.models.production import Order, OrderItem, ProductBOM, ProductType, Res
 from app.models.inventory import Stock, Component  # Component используется для вытягивания наименований деталей
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
+from app.services.auth_service import require_roles
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
 from app.schemas.order import OrderCreate, OrderOut
@@ -177,7 +178,10 @@ def _structured_bom_summary_for_order(order_items, db: Session):
 
 
 @router.get("/orders", response_model=List[OrderOut], summary="Получить список всех заказов")
-def get_production_orders(db: Session = Depends(get_db)):
+def get_production_orders(
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production")),
+):
     """
     Возвращает список всех заказов.
     Благодаря response_model=List[OrderOut], Pydantic автоматически трансформирует
@@ -191,7 +195,11 @@ def get_production_orders(db: Session = Depends(get_db)):
 
 
 @router.post("/orders", summary="Создать многопозиционный заказ")
-def create_production_order(payload: OrderCreate, db: Session = Depends(get_db)):
+def create_production_order(
+    payload: OrderCreate,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "production")),
+):
     """
     Создает заказ для конкретного заказчика с несколькими изделиями.
     Суммирует требования BOM и резервирует компоненты.
@@ -245,7 +253,11 @@ def create_production_order(payload: OrderCreate, db: Session = Depends(get_db))
 
 
 @router.post("/orders/{order_id}/issue-materials", summary="Выдача материалов под весь заказ")
-def issue_materials_for_order(order_id: int, db: Session = Depends(get_db)):
+def issue_materials_for_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse")),
+):
     """
     Списывает зарезервированные материалы под все позиции этого заказа.
     """
@@ -305,7 +317,11 @@ def issue_materials_for_order(order_id: int, db: Session = Depends(get_db)):
 # ИСПРАВЛЕННЫЙ ЭНДПОИНТ: Сводная ведомость комплектующих с защитой от AttributeError
 # =====================================================================
 @router.get("/orders/{order_id}/bom-summary", summary="Сводная комплектация для PDF")
-def get_order_bom_summary(order_id: int, db: Session = Depends(get_db)):
+def get_order_bom_summary(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production")),
+):
     """
     Возвращает комплектацию заказа с сохранением структуры:
     изделие верхнего уровня -> сборочная единица -> покупные компоненты/изделия.
