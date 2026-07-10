@@ -4,7 +4,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.models.production import ProductType, ProductBOM
+from app.models.production import ProductType, ProductBOM, BOMMapping
 from app.models.inventory import Component
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
 from app.services.bom_service import BOMMatchingService
@@ -192,6 +192,17 @@ def resolve_bom(product_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "matched_items": count}
 
 
+@router.get("/bom-items/{item_id}/match-candidates")
+def get_bom_match_candidates(item_id: int, db: Session = Depends(get_db)):
+    """Возвращает кандидатов для ручной привязки строки BOM к складскому компоненту."""
+    item = db.query(ProductBOM).get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+
+    candidates = BOMMatchingService(db).find_match_candidates(item.design_name)
+    return {"item_id": item.id, "design_name": item.design_name, "candidates": candidates}
+
+
 @router.put("/bom-items/{item_id}")
 def update_bom_item(item_id: int, data: BOMItemUpdate, db: Session = Depends(get_db)):
     """Обновление строки спецификации и гибкое переопределение её привязки."""
@@ -210,6 +221,15 @@ def update_bom_item(item_id: int, data: BOMItemUpdate, db: Session = Depends(get
         item.resource_id = data.resource_id
         item.resource_type = data.resource_type if data.resource_type != "raw_string" else "component"
         item.is_resolved = True
+
+        if item.resource_type == "component":
+            mapping = db.query(BOMMapping).filter(BOMMapping.design_name == item.design_name).first()
+            if not mapping:
+                mapping = BOMMapping(design_name=item.design_name)
+                db.add(mapping)
+            mapping.component_id = item.resource_id
+            mapping.mapping_type = "manual"
+            mapping.is_verified = True
     else:
         # Если фронтенд прислал null, 0 или явно флаг снятия привязки
         item.resource_id = None

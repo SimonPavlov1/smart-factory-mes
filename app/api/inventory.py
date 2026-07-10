@@ -10,6 +10,38 @@ from app.schemas.inventory import ComponentCreate
 router = APIRouter(tags=["Склад (Inventory)"])
 
 
+def _component_payload(component: Component, quantity: float = 0.0):
+    return {
+        "id": component.id,
+        "name": component.name,
+        "part_number": component.part_number,
+        "category": component.category or "Прочие компоненты",
+        "package": component.package,
+        "value": component.value,
+        "value_numeric": component.value_numeric,
+        "voltage": component.voltage,
+        "specifications": component.specifications,
+        "quantity": quantity or 0.0,
+    }
+
+
+def _apply_component_search(query, search: Optional[str]):
+    if search and search.strip():
+        search_words = search.strip().split()
+        conditions = []
+        for word in search_words:
+            pattern = f"%{word}%"
+            conditions.append(or_(
+                Component.name.ilike(pattern),
+                Component.category.ilike(pattern),
+                Component.package.ilike(pattern),
+                Component.value.ilike(pattern),
+                Component.part_number.ilike(pattern)
+            ))
+        query = query.filter(and_(*conditions))
+    return query
+
+
 @router.post("/components")
 def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
     """Регистрация нового компонента в справочнике."""
@@ -38,35 +70,40 @@ def create_component(data: ComponentCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/components")
-def get_components(search: Optional[str] = Query(None), db: Session = Depends(get_db)):
+def get_components(
+    search: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
     """Получение списка компонентов с фильтрацией по поисковому запросу."""
-    query = db.query(Component)
+    query = _apply_component_search(db.query(Component), search)
+    components = query.order_by(Component.category, Component.name).offset(offset).limit(limit).all()
+    component_ids = [component.id for component in components]
+    stock_map = {
+        s.component_id: s.actual_qty
+        for s in db.query(Stock).filter(Stock.component_id.in_(component_ids)).all()
+    } if component_ids else {}
 
-    if search and search.strip():
-        search_words = search.strip().split()
-        conditions = []
-        for word in search_words:
-            pattern = f"%{word}%"
-            conditions.append(or_(
-                Component.name.ilike(pattern),
-                Component.category.ilike(pattern),
-                Component.package.ilike(pattern),
-                Component.value.ilike(pattern),
-                Component.part_number.ilike(pattern)
-            ))
-        query = query.filter(and_(*conditions))
+    return [_component_payload(comp, stock_map.get(comp.id, 0.0)) for comp in components]
 
-    components = query.all()
-    stock_map = {s.component_id: s.actual_qty for s in db.query(Stock).all()}
 
-    return [
-        {
-            **comp.__dict__,
-            "category": comp.category or "Прочие компоненты",
-            "quantity": stock_map.get(comp.id, 0.0)
-        }
-        for comp in components
-    ]
+@router.get("/components/search")
+def search_components(
+    q: str = Query("", description="Поиск по названию, артикулу, категории, корпусу или номиналу"),
+    limit: int = Query(25, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Короткий поиск компонентов для dropdown-подбора BOM без загрузки всего склада."""
+    query = _apply_component_search(db.query(Component), q)
+    components = query.order_by(Component.part_number, Component.name).limit(limit).all()
+    component_ids = [component.id for component in components]
+    stock_map = {
+        s.component_id: s.actual_qty
+        for s in db.query(Stock).filter(Stock.component_id.in_(component_ids)).all()
+    } if component_ids else {}
+
+    return [_component_payload(comp, stock_map.get(comp.id, 0.0)) for comp in components]
 
 
 @router.get("/components/categories", response_model=List[str])
