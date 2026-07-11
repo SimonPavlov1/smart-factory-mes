@@ -8,6 +8,7 @@ VALID_ROLES = [
     "manager",
     "engineer",
     "procurement",
+    "accounting",
     "assembler",
     "tester",
     "repair_engineer",

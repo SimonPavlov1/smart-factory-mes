@@ -25,6 +25,7 @@ ROLE_PERMISSIONS = {
     "manager": ["inventory:read", "production:read", "manufacturing:read", "manufacturing:write", "procurement:write"],
     "engineer": ["inventory:read", "production:read", "production:write"],
     "procurement": ["inventory:read", "procurement:write", "manufacturing:read"],
+    "accounting": ["procurement:pay", "manufacturing:read"],
     "assembler": ["production:read", "manufacturing:read", "manufacturing:write"],
     "tester": ["production:read", "manufacturing:read", "quality:write"],
     "repair_engineer": ["production:read", "manufacturing:read", "quality:repair"],

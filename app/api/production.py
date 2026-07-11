@@ -86,7 +86,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 @router.get("/products")
 def get_all_products(
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "engineer", "manager", "production", "warehouse")),
+    _=Depends(require_roles("admin", "engineer", "manager", "production", "warehouse", "assembler", "tester", "repair_engineer")),
 ):
     """Получение всех изделий с группировкой по категориям компонентов."""
     products = db.query(ProductType).options(selectinload(ProductType.components)).all()

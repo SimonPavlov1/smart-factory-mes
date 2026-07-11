@@ -8,6 +8,7 @@ from app.models.inventory import Stock, Component  # Component использу�
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
 from app.services.auth_service import require_roles
+from app.services.workflow_service import create_initial_order_tasks, find_shortages
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
 from app.schemas.order import OrderCreate, OrderOut
@@ -180,7 +181,7 @@ def _structured_bom_summary_for_order(order_items, db: Session):
 @router.get("/orders", response_model=List[OrderOut], summary="Получить список всех заказов")
 def get_production_orders(
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "manager", "warehouse", "production")),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
 ):
     """
     Возвращает список всех заказов.
@@ -212,10 +213,7 @@ def create_production_order(
             if item.quantity <= 0:
                 raise HTTPException(status_code=400, detail="Количество изделия должно быть больше нуля")
 
-        new_order = Order(
-            customer_name=payload.customer_name,
-            status="Reserved"
-        )
+        new_order = Order(customer_name=payload.customer_name, status="Created")
         db.add(new_order)
         db.flush()  # Получаем id созданного заказа
 
@@ -231,18 +229,28 @@ def create_production_order(
 
         total_needed_items = _calculate_materials_for_items(order_items, db)
         materials_list = _materials_list(total_needed_items)
+        shortages = find_shortages(db, materials_list)
 
-        reserve_components(db, materials_list)
+        if not shortages:
+            reserve_components(db, materials_list)
 
-        for material in materials_list:
-            db.add(Reservation(
-                order_id=new_order.id,
-                component_id=material["component_id"],
-                qty=material["qty"]
-            ))
+            for material in materials_list:
+                db.add(Reservation(
+                    order_id=new_order.id,
+                    component_id=material["component_id"],
+                    qty=material["qty"]
+                ))
+
+        create_initial_order_tasks(db, new_order, materials_list, shortages)
 
         db.commit()
-        return {"status": "success", "order_id": new_order.id, "details": materials_list}
+        return {
+            "status": "success",
+            "order_id": new_order.id,
+            "order_status": new_order.status,
+            "details": materials_list,
+            "shortages": shortages,
+        }
 
     except HTTPException:
         db.rollback()
@@ -320,7 +328,7 @@ def issue_materials_for_order(
 def get_order_bom_summary(
     order_id: int,
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "manager", "warehouse", "production")),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
 ):
     """
     Возвращает комплектацию заказа с сохранением структуры:

@@ -1,14 +1,21 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.database import engine, Base, SessionLocal
-from app.api import auth, inventory, production, procurement, manufacturing
+from app.api import auth, inventory, production, procurement, manufacturing, tasks
 from app.services.auth_service import ensure_default_admin
 
 # Создаем все таблицы в базе данных на основе наших моделей.
 # Если база данных пуста или файла sql_app.db нет, он будет создан автоматически.
 # В продакшене обычно используются миграции (Alembic), но для текущего этапа это идеальный вариант.
 Base.metadata.create_all(bind=engine)
+with engine.begin() as conn:
+    columns = {column["name"] for column in inspect(conn).get_columns("workflow_tasks")}
+    if "assigned_user_id" not in columns:
+        conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN assigned_user_id INTEGER"))
+    if "started_at" not in columns:
+        conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN started_at DATETIME"))
 with SessionLocal() as db:
     ensure_default_admin(db)
 
@@ -35,6 +42,7 @@ app.include_router(inventory.router, prefix="/inventory", tags=["Склад (Inv
 app.include_router(production.router, prefix="/production", tags=["Производство (Production)"])
 app.include_router(procurement.router, prefix="/procurement", tags=["Закупки (Procurement)"])
 app.include_router(manufacturing.router)
+app.include_router(tasks.router)
 app.include_router(auth.router)
 
 @app.get("/", tags=["Системные"])

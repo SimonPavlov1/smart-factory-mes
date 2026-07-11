@@ -9,6 +9,7 @@ from app.schemas.inventory import ComponentCreate
 from app.services.auth_service import require_roles
 
 router = APIRouter(tags=["Склад (Inventory)"])
+INVENTORY_READ_ROLES = ("admin", "warehouse", "manager", "engineer", "production", "procurement")
 
 
 def _component_payload(component: Component, quantity: float = 0.0):
@@ -80,7 +81,7 @@ def get_components(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES)),
 ):
     """Получение списка компонентов с фильтрацией по поисковому запросу."""
     query = _apply_component_search(db.query(Component), search)
@@ -99,7 +100,7 @@ def search_components(
     q: str = Query("", description="Поиск по названию, артикулу, категории, корпусу или номиналу"),
     limit: int = Query(25, ge=1, le=100),
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES)),
 ):
     """Короткий поиск компонентов для dropdown-подбора BOM без загрузки всего склада."""
     query = _apply_component_search(db.query(Component), q)
@@ -116,7 +117,7 @@ def search_components(
 @router.get("/components/categories", response_model=List[str])
 def get_unique_categories(
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES)),
 ):
     """Получение списка всех уникальных категорий."""
     categories = db.query(Component.category).distinct().all()
@@ -129,7 +130,7 @@ def get_unique_categories(
 def get_component_by_id(
     component_id: int,
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse", "manager", "engineer", "production")),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES)),
 ):
     """Получение подробной карточки компонента по ID."""
     component = db.query(Component).get(component_id)

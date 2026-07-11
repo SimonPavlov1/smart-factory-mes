@@ -11,7 +11,7 @@ router = APIRouter(tags=["Закупки (Procurement)"])
 def create_purchase_order(
     supplier: str,
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "manager")),
+    _=Depends(require_roles("admin", "manager", "procurement")),
 ):
     """Создать новый черновик заказа поставщику."""
     new_order = PurchaseOrder(supplier_name=supplier, status="Draft")

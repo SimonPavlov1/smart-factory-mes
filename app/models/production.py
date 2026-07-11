@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, Float, ForeignKey, func, and_
+from sqlalchemy import Column, Integer, String, Boolean, Text, Float, ForeignKey, JSON, func, and_
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import DateTime
 from app.database import Base
@@ -177,7 +177,9 @@ class WorkflowTask(Base):
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     role = Column(String, index=True, nullable=False)
-    status = Column(String, default="open", index=True, nullable=False)
+    status = Column(String, default="assigned", index=True, nullable=False)
+    assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     payload = Column(JSON, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
