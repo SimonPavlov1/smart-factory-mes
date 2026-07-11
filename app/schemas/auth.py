@@ -2,7 +2,18 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
-VALID_ROLES = ["admin", "warehouse", "manager", "engineer", "production"]
+VALID_ROLES = [
+    "admin",
+    "warehouse",
+    "manager",
+    "engineer",
+    "procurement",
+    "assembler",
+    "tester",
+    "repair_engineer",
+    "packer",
+    "production",
+]
 
 
 class LoginRequest(BaseModel):

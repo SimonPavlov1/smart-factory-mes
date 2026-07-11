@@ -24,6 +24,11 @@ ROLE_PERMISSIONS = {
     "warehouse": ["inventory:read", "inventory:write", "manufacturing:read", "manufacturing:issue"],
     "manager": ["inventory:read", "production:read", "manufacturing:read", "manufacturing:write", "procurement:write"],
     "engineer": ["inventory:read", "production:read", "production:write"],
+    "procurement": ["inventory:read", "procurement:write", "manufacturing:read"],
+    "assembler": ["production:read", "manufacturing:read", "manufacturing:write"],
+    "tester": ["production:read", "manufacturing:read", "quality:write"],
+    "repair_engineer": ["production:read", "manufacturing:read", "quality:repair"],
+    "packer": ["manufacturing:read", "shipping:pack"],
     "production": ["production:read", "manufacturing:read", "manufacturing:write"],
 }
 
