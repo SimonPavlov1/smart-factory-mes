@@ -162,3 +162,22 @@ class Item(Base):
     test_result = Column(String, nullable=True, comment="Результат прохождения ОТК.")
 
     order = relationship("Order", back_populates="items_sn")
+
+
+class WorkflowTask(Base):
+    """
+    Задача производственного workflow.
+    Создается системой при переходах заказа между ролями.
+    """
+    __tablename__ = "workflow_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), index=True, nullable=True)
+    type = Column(String, index=True, nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    role = Column(String, index=True, nullable=False)
+    status = Column(String, default="open", index=True, nullable=False)
+    payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    completed_at = Column(DateTime, nullable=True)
