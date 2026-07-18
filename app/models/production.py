@@ -44,6 +44,8 @@ class ProductType(Base):
 
     revision = Column(String, default="1.0", comment="Версия КД или ревизия печатной платы.")
     bill_of_materials_url = Column(String, nullable=True, comment="Путь к чертежам, PDF или исходникам проекта.")
+    photo_url = Column(String, nullable=True, comment="Фото или рендер изделия для карточки")
+    attachments = Column(JSON, default=list, comment="Файлы КД, сборочные чертежи, составы и прочая документация")
     description = Column(Text, nullable=True, comment="Технические особенности или нюансы сборки.")
 
     # Связи
@@ -61,6 +63,8 @@ class ProductBOM(Base):
     __tablename__ = "product_boms"
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey("product_types.id"), comment="Владелец спецификации")
+    parent_id = Column(Integer, ForeignKey("product_boms.id"), nullable=True, index=True,
+                       comment="Родительская строка состава для древовидной структуры")
 
     design_name = Column(String, nullable=False, index=True,
                          comment="Текст из ПЭ3. Позволяет хранить состав даже без привязки к складу.")
@@ -73,6 +77,10 @@ class ProductBOM(Base):
 
     resource_type = Column(String, nullable=False, default="component",
                            comment="Дискриминатор: 'component' (покупное) или 'product' (свой узел).")
+    item_type = Column(String, nullable=False, default="component",
+                       comment="'assembly', 'component' или 'operation'")
+    operation_role = Column(String, nullable=True, comment="Роль/участок для выполнения работы")
+    sort_order = Column(Integer, nullable=False, default=0, comment="Порядок строки внутри родителя")
 
     quantity = Column(Float, nullable=False, default=1.0, comment="Количество на 1 шт. готового изделия.")
 

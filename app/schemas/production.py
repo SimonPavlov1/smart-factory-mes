@@ -34,6 +34,10 @@ class BOMItemCreate(BOMItemBase):
 
     # 'component' (покупная деталь) или 'product' (узел собственного изготовления)
     resource_type: str = Field(default="component", description="Тип ресурса для логики резервирования")
+    item_type: str = Field(default="component", description="Тип строки: assembly, component или operation")
+    parent_id: Optional[int] = Field(default=None, description="Родительская строка состава")
+    operation_role: Optional[str] = Field(default=None, description="Роль/участок для операции")
+    sort_order: int = Field(default=0, description="Порядок строки внутри родителя")
 
     # Статус успешности автоматического сопоставления со складом
     is_resolved: bool = Field(default=False, description="Привязана ли строка к реальному товару")

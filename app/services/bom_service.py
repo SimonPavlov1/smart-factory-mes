@@ -179,7 +179,8 @@ class BOMMatchingService:
         service = BOMMatchingService(db)
         items_to_resolve = db.query(ProductBOM).filter(
             ProductBOM.product_id == product_id,
-            ProductBOM.is_resolved == False
+            ProductBOM.is_resolved == False,
+            ProductBOM.item_type == "component"
         ).all()
 
         matched_count = 0
@@ -252,8 +253,11 @@ class BOMMatchingService:
             designators = row.get("designators", "")
             quantity = row.get("quantity", 0)
 
-            # Определение категории по заголовку (если нет десигнаторов)
-            if not designators and design_name and len(design_name.split()) < 3:
+            explicit_item_type = row.get("item_type")
+
+            # Определение категории по заголовку оставляем только для импортов,
+            # где тип строки не задан явно.
+            if not explicit_item_type and not designators and design_name and len(design_name.split()) < 3:
                 self.current_category = design_name
                 continue
 
@@ -261,16 +265,23 @@ class BOMMatchingService:
             if not design_name:
                 continue
 
-            # Пытаемся найти автоподбором на складе
-            match = self.find_best_match(design_name)
-            component_id = match["component_id"] if match else None
-
             # Получаем тип ресурса, который прислал фронтенд (опционально)
             incoming_resource_type = row.get("resource_type", "raw_string")
+            item_type = explicit_item_type or ("assembly" if incoming_resource_type in ["product", "subassembly"] else "component")
+            component_id = None
+
+            # Пытаемся найти автоподбором только для покупных компонентов.
+            match = self.find_best_match(design_name) if item_type == "component" else None
+            if match:
+                component_id = match["component_id"]
+
+            if item_type == "operation":
+                incoming_resource_type = "operation"
 
             # Формируем запись для базы данных спецификации
             bom_item = ProductBOM(
                 product_id=product_id,
+                parent_id=row.get("parent_id"),
                 design_name=design_name,  # ИМЯ ТЕПЕРЬ СОХРАНИТСЯ НАВСЕГДА!
                 designators=designators,
                 quantity=float(quantity),
@@ -279,7 +290,10 @@ class BOMMatchingService:
                 # Если компонент успешно сопоставлен со складом — пишем 'component'.
                 # Если совпадений нет — сохраняем тот тип, который передал фронтенд ('raw_string')
                 resource_type="component" if component_id else incoming_resource_type,
-                is_resolved=True if component_id else False
+                item_type=item_type,
+                operation_role=row.get("operation_role"),
+                sort_order=row.get("sort_order") or 0,
+                is_resolved=True if component_id or item_type == "operation" else False
             )
             self.db.add(bom_item)
             bom_items.append(bom_item)
@@ -287,7 +301,7 @@ class BOMMatchingService:
             # Если складской аналог не найден, фиксируем строку в таблице неразрешенных маппингов
             if component_id:
                 self._remember_mapping(design_name, component_id, mapping_type="auto", is_verified=False)
-            else:
+            elif item_type == "component":
                 self._ensure_mapping_exists(design_name)
 
         self.db.commit()

@@ -81,11 +81,32 @@ def _collect_structured_bom(product_id: int, multiplier: float, device: str, ass
 
     current_visited = visited | {product_id}
     bom_items = db.query(ProductBOM).filter(ProductBOM.product_id == product_id).all()
+    children_by_parent = {}
+    for item in bom_items:
+        if item.parent_id:
+            children_by_parent.setdefault(item.parent_id, []).append(item)
 
-    for bom in bom_items:
-        total_qty = bom.quantity * multiplier
+    def visit_bom(bom, current_multiplier, current_assembly):
+        item_type = bom.item_type or ("assembly" if bom.resource_type in ["product", "subassembly"] else "component")
+        total_qty = bom.quantity * current_multiplier
 
-        if bom.resource_type == "component":
+        if item_type == "operation":
+            _append_bom_summary_item(result_map, {
+                "id": f"operation-{bom.id}",
+                "component_id": None,
+                "bom_item_id": bom.id,
+                "name": bom.design_name,
+                "sku": bom.operation_role or "—",
+                "qty": total_qty,
+                "device": device,
+                "assembly": current_assembly,
+                "category": "Работы и операции",
+                "designators": bom.designators,
+                "item_type": "operation",
+            })
+            return
+
+        if item_type == "component" and bom.resource_type == "component":
             component = db.query(Component).filter(Component.id == bom.resource_id).first() if bom.resource_id else None
             _append_bom_summary_item(result_map, {
                 "id": component.id if component else f"bom-{bom.id}",
@@ -95,18 +116,18 @@ def _collect_structured_bom(product_id: int, multiplier: float, device: str, ass
                 "sku": component.part_number if component else "—",
                 "qty": total_qty,
                 "device": device,
-                "assembly": assembly,
+                "assembly": current_assembly,
                 "category": component.category if component and component.category else "Покупные компоненты",
                 "designators": bom.designators,
                 "item_type": "purchased_component" if component else "unresolved_purchase",
             })
-            continue
+            return
 
-        if bom.resource_type in ["product", "subassembly"]:
+        if item_type == "assembly":
             sub_product = db.query(ProductType).filter(ProductType.id == bom.resource_id).first() if bom.resource_id else None
             subassembly_name = _product_label(sub_product) if sub_product else bom.design_name
             assembly_path = (
-                subassembly_name if assembly == "Основной состав" else f"{assembly} / {subassembly_name}"
+                subassembly_name if current_assembly == "Основной состав" else f"{current_assembly} / {subassembly_name}"
             )
 
             if sub_product and db.query(ProductBOM).filter(ProductBOM.product_id == sub_product.id).first():
@@ -119,7 +140,13 @@ def _collect_structured_bom(product_id: int, multiplier: float, device: str, ass
                     db=db,
                     visited=current_visited,
                 )
-                continue
+                return
+
+            local_children = children_by_parent.get(bom.id, [])
+            if local_children:
+                for child in local_children:
+                    visit_bom(child, total_qty, assembly_path)
+                return
 
             _append_bom_summary_item(result_map, {
                 "id": sub_product.id if sub_product else f"bom-{bom.id}",
@@ -129,12 +156,12 @@ def _collect_structured_bom(product_id: int, multiplier: float, device: str, ass
                 "sku": sub_product.sku if sub_product and sub_product.sku else "—",
                 "qty": total_qty,
                 "device": device,
-                "assembly": assembly,
+                "assembly": current_assembly,
                 "category": "Покупные изделия и узлы",
                 "designators": bom.designators,
                 "item_type": "purchased_product",
             })
-            continue
+            return
 
         _append_bom_summary_item(result_map, {
             "id": f"bom-{bom.id}",
@@ -144,11 +171,16 @@ def _collect_structured_bom(product_id: int, multiplier: float, device: str, ass
             "sku": "—",
             "qty": total_qty,
             "device": device,
-            "assembly": assembly,
+            "assembly": current_assembly,
             "category": "Непривязанные позиции",
             "designators": bom.designators,
             "item_type": "unresolved_purchase",
         })
+
+    for bom in bom_items:
+        if bom.parent_id:
+            continue
+        visit_bom(bom, multiplier, assembly)
 
 
 def _structured_bom_summary_for_order(order_items, db: Session):
