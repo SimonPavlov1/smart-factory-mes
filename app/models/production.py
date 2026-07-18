@@ -118,6 +118,7 @@ class Order(Base):
     status = Column(String, default="In Progress", index=True,
                     comment="Этап: In Progress -> In Production -> Completed.")
     created_at = Column(DateTime, server_default=func.now(), comment="Время постановки в очередь.")
+    planned_delivery_date = Column(DateTime, nullable=True, comment="Плановая дата поставки заказчику")
 
     # Связи
     # lazy="joined" автоматически подгружает список позиций при базовом запросе к заказу
@@ -189,5 +190,6 @@ class WorkflowTask(Base):
     assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     payload = Column(JSON, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    due_date = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

@@ -31,6 +31,7 @@ class OrderOut(BaseModel):
     customer_name: str
     status: str
     created_at: datetime
+    planned_delivery_date: Optional[datetime] = None
     items: List[OrderItemOut]  # Список позиций
 
     class Config:
@@ -48,4 +49,5 @@ class OrderItemCreate(BaseModel):
 class OrderCreate(BaseModel):
     """Схема, которую присылает фронтенд при создании нового заказа"""
     customer_name: str = Field(min_length=1)
+    planned_delivery_date: Optional[str] = None
     items: List[OrderItemCreate]

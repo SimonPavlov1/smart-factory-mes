@@ -16,6 +16,8 @@ with engine.begin() as conn:
         conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN assigned_user_id INTEGER"))
     if "started_at" not in columns:
         conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN started_at DATETIME"))
+    if "due_date" not in columns:
+        conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN due_date DATETIME"))
     bom_columns = {column["name"] for column in inspect(conn).get_columns("product_boms")}
     if "parent_id" not in bom_columns:
         conn.execute(text("ALTER TABLE product_boms ADD COLUMN parent_id INTEGER"))
@@ -30,6 +32,9 @@ with engine.begin() as conn:
         conn.execute(text("ALTER TABLE product_types ADD COLUMN photo_url VARCHAR"))
     if "attachments" not in product_columns:
         conn.execute(text("ALTER TABLE product_types ADD COLUMN attachments JSON"))
+    order_columns = {column["name"] for column in inspect(conn).get_columns("orders")}
+    if "planned_delivery_date" not in order_columns:
+        conn.execute(text("ALTER TABLE orders ADD COLUMN planned_delivery_date DATETIME"))
 with SessionLocal() as db:
     ensure_default_admin(db)
 

@@ -32,6 +32,10 @@ class TaskAssignPayload(BaseModel):
     user_id: Optional[int] = None
 
 
+class TaskDeadlinePayload(BaseModel):
+    due_date: Optional[str] = None
+
+
 class ProcurementPurchasePayload(BaseModel):
     component_id: int
     qty: float
@@ -75,6 +79,7 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
         "assigned_user": _user_payload(assigned_user),
         "payload": payload,
         "created_at": task.created_at,
+        "due_date": task.due_date,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
     }
@@ -159,6 +164,10 @@ def take_task(
         raise HTTPException(status_code=404, detail="Задача не найдена")
     if task.status == "done":
         raise HTTPException(status_code=400, detail="Задача уже закрыта")
+    if task.status == "waiting_delivery":
+        raise HTTPException(status_code=400, detail="Задача ожидает поставку и не может быть повторно взята в работу")
+    if task.status == "in_progress" and task.assigned_user_id == user.id:
+        raise HTTPException(status_code=400, detail="Задача уже в работе у текущего пользователя")
     if task.assigned_user_id and task.assigned_user_id != user.id:
         raise HTTPException(status_code=400, detail="Задача уже назначена другому сотруднику")
     if user.role not in ["admin", "manager"] and task.role != user.role:
@@ -195,6 +204,31 @@ def assign_task(
     task.assigned_user_id = assignee.id if assignee else None
     task.status = "assigned"
     task.started_at = None
+    db.commit()
+    return _task_payload(task, db)
+
+
+@router.post("/{task_id}/deadline")
+def set_task_deadline(
+    task_id: int,
+    payload: TaskDeadlinePayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "manager")),
+):
+    task = db.query(WorkflowTask).filter(WorkflowTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if task.status == "done":
+        raise HTTPException(status_code=400, detail="Задача уже закрыта")
+
+    if payload.due_date:
+        try:
+            task.due_date = datetime.fromisoformat(payload.due_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Некорректная дата дедлайна")
+    else:
+        task.due_date = None
+
     db.commit()
     return _task_payload(task, db)
 

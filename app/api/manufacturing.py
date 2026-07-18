@@ -1,9 +1,12 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 
 from app.database import get_db
-from app.models.production import Order, OrderItem, ProductBOM, ProductType, Reservation
+from app.models.auth import User
+from app.models.production import Item, Order, OrderItem, ProductBOM, ProductType, Reservation, WorkflowTask
 from app.models.inventory import Stock, Component  # Component используется для вытягивания наименований деталей
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
@@ -14,6 +17,69 @@ from app.services.workflow_service import create_initial_order_tasks, find_short
 from app.schemas.order import OrderCreate, OrderOut
 
 router = APIRouter(prefix="/manufacturing", tags=["Производство (Заказы)"])
+
+ORDER_STAGES = [
+    {
+        "key": "procurement",
+        "title": "Закупка",
+        "description": "Оформление недостающих комплектующих",
+        "task_types": ["procurement_purchase"],
+    },
+    {
+        "key": "accounting",
+        "title": "Оплата",
+        "description": "Оплата счетов по закупке",
+        "task_types": ["accounting_payment"],
+    },
+    {
+        "key": "warehouse_receive",
+        "title": "Приемка на склад",
+        "description": "Приход комплектующих от поставщика",
+        "task_types": ["warehouse_receive_components"],
+    },
+    {
+        "key": "warehouse_issue",
+        "title": "Выдача комплектующих",
+        "description": "Передача комплекта сборщику",
+        "task_types": ["warehouse_issue_materials"],
+    },
+    {
+        "key": "assembler_receive",
+        "title": "Получение сборщиком",
+        "description": "Подтверждение получения комплекта",
+        "task_types": ["assembler_receive_materials"],
+    },
+    {
+        "key": "assembly",
+        "title": "Сборка",
+        "description": "Сборка изделий по заказу",
+        "task_types": ["assembler_build"],
+    },
+    {
+        "key": "testing",
+        "title": "Тестирование",
+        "description": "Проверка и фиксация брака",
+        "task_types": ["tester_check"],
+    },
+    {
+        "key": "repair",
+        "title": "Ремонт брака",
+        "description": "Устранение выявленных дефектов",
+        "task_types": ["repair_defects"],
+    },
+    {
+        "key": "packing",
+        "title": "Упаковка",
+        "description": "Передача годных изделий на упаковку",
+        "task_types": ["packer_pack"],
+    },
+    {
+        "key": "finished_goods",
+        "title": "Склад готовой продукции",
+        "description": "Оприходование готовых изделий",
+        "task_types": ["warehouse_finished_goods"],
+    },
+]
 
 
 def _add_material(total_needed_items: dict, component_id: int, qty: float):
@@ -210,6 +276,112 @@ def _structured_bom_summary_for_order(order_items, db: Session):
     )
 
 
+def _parse_optional_date(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректная дата поставки")
+
+
+def _user_payload(user: User | None):
+    if not user:
+        return None
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+    }
+
+
+def _task_payload(task: WorkflowTask, users_by_id: dict[int, User] | None = None):
+    assigned_user = users_by_id.get(task.assigned_user_id) if users_by_id and task.assigned_user_id else None
+    return {
+        "id": task.id,
+        "type": task.type,
+        "title": task.title,
+        "description": task.description,
+        "role": task.role,
+        "status": task.status,
+        "assigned_user_id": task.assigned_user_id,
+        "assigned_user": _user_payload(assigned_user),
+        "payload": task.payload or {},
+        "created_at": task.created_at,
+        "due_date": task.due_date,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+
+
+def _stage_status(tasks: list[WorkflowTask]) -> str:
+    if not tasks:
+        return "not_created"
+    if all(task.status == "done" for task in tasks):
+        return "done"
+    if any(task.status == "in_progress" for task in tasks):
+        return "in_progress"
+    if any(task.status in ["assigned", "open", "waiting_delivery"] for task in tasks):
+        return "assigned"
+    return tasks[-1].status or "assigned"
+
+
+def _order_payload(order: Order, db: Session):
+    tasks = (
+        db.query(WorkflowTask)
+        .filter(WorkflowTask.order_id == order.id)
+        .order_by(WorkflowTask.created_at.asc(), WorkflowTask.id.asc())
+        .all()
+    )
+    tasks_by_type = {}
+    for task in tasks:
+        tasks_by_type.setdefault(task.type, []).append(task)
+    user_ids = [task.assigned_user_id for task in tasks if task.assigned_user_id]
+    users_by_id = {
+        user.id: user
+        for user in db.query(User).filter(User.id.in_(user_ids)).all()
+    } if user_ids else {}
+
+    stages = []
+    for stage in ORDER_STAGES:
+        stage_tasks = []
+        for task_type in stage["task_types"]:
+            stage_tasks.extend(tasks_by_type.get(task_type, []))
+        stage_tasks.sort(key=lambda task: (task.created_at, task.id))
+        stages.append({
+            "key": stage["key"],
+            "title": stage["title"],
+            "description": stage["description"],
+            "status": _stage_status(stage_tasks),
+            "tasks": [_task_payload(task, users_by_id) for task in stage_tasks],
+        })
+
+    return {
+        "id": order.id,
+        "customer_name": order.customer_name,
+        "status": order.status,
+        "created_at": order.created_at,
+        "planned_delivery_date": order.planned_delivery_date,
+        "items": [
+            {
+                "id": item.id,
+                "product_id": item.product_id,
+                "quantity": item.quantity,
+                "product": {
+                    "id": item.product.id,
+                    "name": item.product.name,
+                    "sku": item.product.sku,
+                    "drawing_number": item.product.drawing_number,
+                } if item.product else None,
+            }
+            for item in order.items
+        ],
+        "tasks": [_task_payload(task, users_by_id) for task in tasks],
+        "stages": stages,
+    }
+
+
 @router.get("/orders", response_model=List[OrderOut], summary="Получить список всех заказов")
 def get_production_orders(
     db: Session = Depends(get_db),
@@ -245,7 +417,11 @@ def create_production_order(
             if item.quantity <= 0:
                 raise HTTPException(status_code=400, detail="Количество изделия должно быть больше нуля")
 
-        new_order = Order(customer_name=payload.customer_name, status="Created")
+        new_order = Order(
+            customer_name=payload.customer_name,
+            status="Created",
+            planned_delivery_date=_parse_optional_date(payload.planned_delivery_date),
+        )
         db.add(new_order)
         db.flush()  # Получаем id созданного заказа
 
@@ -290,6 +466,44 @@ def create_production_order(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/orders/{order_id}", summary="Детальная карточка заказа с производственной цепочкой")
+def get_production_order_detail(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer", "accounting")),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    return _order_payload(order, db)
+
+
+@router.delete("/orders/{order_id}", summary="Удалить производственный заказ")
+def delete_production_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "production")),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+
+    reservations = db.query(Reservation).filter(Reservation.order_id == order_id).all()
+    if order.status in ["Reserved", "In Progress", "Procurement Required"]:
+        for reservation in reservations:
+            stock = db.query(Stock).filter(Stock.component_id == reservation.component_id).first()
+            if stock:
+                stock.reserved_qty = max((stock.reserved_qty or 0) - reservation.qty, 0)
+
+    db.query(WorkflowTask).filter(WorkflowTask.order_id == order_id).delete(synchronize_session=False)
+    db.query(Item).filter(Item.order_id == order_id).delete(synchronize_session=False)
+    db.query(Reservation).filter(Reservation.order_id == order_id).delete(synchronize_session=False)
+    db.query(OrderItem).filter(OrderItem.order_id == order_id).delete(synchronize_session=False)
+    db.delete(order)
+    db.commit()
+    return {"status": "success", "detail": "Заказ удален"}
 
 
 @router.post("/orders/{order_id}/issue-materials", summary="Выдача материалов под весь заказ")
