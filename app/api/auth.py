@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.auth import User
+from app.models.production import WorkflowTask
 from app.schemas.auth import LoginRequest, MeResponse, TokenResponse, UserCreate, UserOut, UserUpdate, VALID_ROLES
 from app.services.auth_service import (
     create_access_token,
@@ -196,3 +197,36 @@ def update_user(
     db.commit()
     db.refresh(user)
     return _user_out(user)
+
+
+@router.delete("/admin/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin")),
+):
+    if current_user.id == user_id:
+        raise HTTPException(status_code=400, detail="Нельзя удалить текущую учетную запись")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    db.query(WorkflowTask).filter(
+        WorkflowTask.assigned_user_id == user_id,
+        WorkflowTask.status != "done",
+    ).update(
+        {
+            WorkflowTask.assigned_user_id: None,
+            WorkflowTask.started_at: None,
+            WorkflowTask.status: "assigned",
+        },
+        synchronize_session=False,
+    )
+    db.query(WorkflowTask).filter(WorkflowTask.assigned_user_id == user_id).update(
+        {WorkflowTask.assigned_user_id: None, WorkflowTask.started_at: None},
+        synchronize_session=False,
+    )
+    db.delete(user)
+    db.commit()
+    return {"status": "success"}
