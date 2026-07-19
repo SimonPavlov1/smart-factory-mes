@@ -11,6 +11,18 @@ from app.services.auth_service import ensure_default_admin
 # В продакшене обычно используются миграции (Alembic), но для текущего этапа это идеальный вариант.
 Base.metadata.create_all(bind=engine)
 with engine.begin() as conn:
+    user_columns = {column["name"] for column in inspect(conn).get_columns("users")}
+    if "last_name" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN last_name VARCHAR"))
+    if "first_name" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN first_name VARCHAR"))
+    if "middle_name" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN middle_name VARCHAR"))
+    if "phone" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR"))
+    if "roles" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN roles JSON"))
+        conn.execute(text("UPDATE users SET roles = json_array(role) WHERE role IS NOT NULL"))
     columns = {column["name"] for column in inspect(conn).get_columns("workflow_tasks")}
     if "assigned_user_id" not in columns:
         conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN assigned_user_id INTEGER"))

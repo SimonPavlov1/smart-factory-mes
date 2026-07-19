@@ -18,7 +18,8 @@ VALID_ROLES = [
 
 
 class LoginRequest(BaseModel):
-    username: str
+    phone: Optional[str] = None
+    username: Optional[str] = None
     password: str
 
 
@@ -28,15 +29,25 @@ class TokenResponse(BaseModel):
 
 
 class UserCreate(BaseModel):
-    username: str = Field(min_length=3)
+    username: Optional[str] = Field(default=None, min_length=3)
     password: str = Field(min_length=6)
     full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    phone: Optional[str] = None
     role: str = Field(default="manager")
+    roles: Optional[List[str]] = None
 
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    phone: Optional[str] = None
     role: Optional[str] = None
+    roles: Optional[List[str]] = None
     is_active: Optional[bool] = None
     password: Optional[str] = Field(default=None, min_length=6)
 
@@ -45,7 +56,12 @@ class UserOut(BaseModel):
     id: int
     username: str
     full_name: Optional[str] = None
+    last_name: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    phone: Optional[str] = None
     role: str
+    roles: List[str] = Field(default_factory=list)
     is_active: bool
 
     class Config:

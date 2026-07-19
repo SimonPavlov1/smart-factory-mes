@@ -67,6 +67,7 @@ def create_access_token(user: User) -> str:
         "sub": str(user.id),
         "username": user.username,
         "role": user.role,
+        "roles": user_roles(user),
         "exp": int(expires_at.timestamp()),
     }
     body = _b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -108,15 +109,36 @@ def require_roles(*roles: Iterable[str]):
     allowed_roles = set(roles)
 
     def dependency(user: User = Depends(get_current_user)) -> User:
-        if user.role == "admin" or user.role in allowed_roles:
+        roles = set(user_roles(user))
+        if "admin" in roles or roles.intersection(allowed_roles):
             return user
         raise HTTPException(status_code=403, detail="Недостаточно прав")
 
     return dependency
 
 
+def user_roles(user: User) -> list[str]:
+    roles = user.roles if isinstance(user.roles, list) else []
+    cleaned = [role for role in roles if isinstance(role, str) and role]
+    if user.role and user.role not in cleaned:
+        cleaned.insert(0, user.role)
+    return cleaned or ["manager"]
+
+
+def user_has_role(user: User, *roles: str) -> bool:
+    current_roles = set(user_roles(user))
+    return "admin" in current_roles or bool(current_roles.intersection(roles))
+
+
 def permissions_for_role(role: str):
     return ROLE_PERMISSIONS.get(role, [])
+
+
+def permissions_for_roles(roles: Iterable[str]):
+    permissions = set()
+    for role in roles:
+        permissions.update(permissions_for_role(role))
+    return sorted(permissions)
 
 
 def ensure_default_admin(db: Session):
@@ -130,6 +152,7 @@ def ensure_default_admin(db: Session):
         password_hash=hash_password(password),
         full_name="Администратор",
         role="admin",
+        roles=["admin"],
         is_active=True,
     ))
     db.commit()

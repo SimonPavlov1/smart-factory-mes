@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.auth import User
 from app.models.production import WorkflowTask
-from app.services.auth_service import get_current_user, require_roles
+from app.services.auth_service import get_current_user, require_roles, user_has_role, user_roles
 from app.services.workflow_service import add_procurement_purchase, complete_task, enrich_component_lines
 
 router = APIRouter(prefix="/tasks", tags=["Workflow задачи"])
@@ -53,6 +53,7 @@ def _user_payload(user: User | None):
         "username": user.username,
         "full_name": user.full_name,
         "role": user.role,
+        "roles": user_roles(user),
     }
 
 
@@ -86,15 +87,15 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
 
 
 def _can_access_task(task: WorkflowTask, user: User):
-    if user.role in ["admin", "manager"]:
+    if user_has_role(user, "admin", "manager"):
         return True
     if task.assigned_user_id:
         return task.assigned_user_id == user.id
-    return task.role == user.role
+    return task.role in user_roles(user)
 
 
 def _can_work_task(task: WorkflowTask, user: User):
-    return user.role in ["admin", "manager"] or task.assigned_user_id == user.id
+    return user_has_role(user, "admin", "manager") or task.assigned_user_id == user.id
 
 
 def _apply_status_filter(query, status: str):
@@ -117,9 +118,9 @@ def get_my_tasks(
     user: User = Depends(get_current_user),
 ):
     query = db.query(WorkflowTask)
-    if user.role != "admin":
+    if not user_has_role(user, "admin"):
         query = query.filter(
-            WorkflowTask.role == user.role,
+            WorkflowTask.role.in_(user_roles(user)),
             or_(WorkflowTask.assigned_user_id.is_(None), WorkflowTask.assigned_user_id == user.id),
         )
     query = _apply_status_filter(query, status)
@@ -170,7 +171,7 @@ def take_task(
         raise HTTPException(status_code=400, detail="Задача уже в работе у текущего пользователя")
     if task.assigned_user_id and task.assigned_user_id != user.id:
         raise HTTPException(status_code=400, detail="Задача уже назначена другому сотруднику")
-    if user.role not in ["admin", "manager"] and task.role != user.role:
+    if not user_has_role(user, "admin", "manager") and task.role not in user_roles(user):
         raise HTTPException(status_code=403, detail="Эта задача назначена другой роли")
 
     task.assigned_user_id = user.id
@@ -198,7 +199,7 @@ def assign_task(
         assignee = db.query(User).filter(User.id == payload.user_id, User.is_active == True).first()
         if not assignee:
             raise HTTPException(status_code=404, detail="Сотрудник не найден")
-        if assignee.role != task.role and assignee.role not in ["admin", "manager"]:
+        if task.role not in user_roles(assignee) and not user_has_role(assignee, "admin", "manager"):
             raise HTTPException(status_code=400, detail="Роль сотрудника не совпадает с ролью задачи")
 
     task.assigned_user_id = assignee.id if assignee else None
@@ -271,6 +272,7 @@ def add_task_note(
     notes.append({
         "author": user.username,
         "role": user.role,
+        "roles": user_roles(user),
         "text": payload.note,
     })
     task.payload = {**task_payload, "notes": notes}

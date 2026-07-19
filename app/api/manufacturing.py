@@ -10,7 +10,7 @@ from app.models.production import Item, Order, OrderItem, ProductBOM, ProductTyp
 from app.models.inventory import Stock, Component  # Component используется для вытягивания наименований деталей
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
-from app.services.auth_service import require_roles
+from app.services.auth_service import require_roles, user_roles
 from app.services.workflow_service import create_initial_order_tasks, find_shortages
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
@@ -293,6 +293,7 @@ def _user_payload(user: User | None):
         "username": user.username,
         "full_name": user.full_name,
         "role": user.role,
+        "roles": user_roles(user),
     }
 
 
