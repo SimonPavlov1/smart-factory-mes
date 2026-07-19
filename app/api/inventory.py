@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, or_
+from sqlalchemy import String, and_, cast, or_
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
@@ -38,7 +38,8 @@ def _apply_component_search(query, search: Optional[str]):
                 Component.category.ilike(pattern),
                 Component.package.ilike(pattern),
                 Component.value.ilike(pattern),
-                Component.part_number.ilike(pattern)
+                Component.part_number.ilike(pattern),
+                cast(Component.specifications, String).ilike(pattern),
             ))
         query = query.filter(and_(*conditions))
     return query

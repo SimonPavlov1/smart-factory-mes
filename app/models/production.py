@@ -104,6 +104,24 @@ class ProductBOM(Base):
         viewonly=True,
         overlaps="resource_component"
     )
+    alternatives = relationship("BOMItemAlternative", back_populates="bom_item", cascade="all, delete-orphan")
+
+
+class BOMItemAlternative(Base):
+    """
+    Разрешенные складские аналоги для строки состава.
+    Например одна строка BOM 'Резистор 10 кОм 1% 0603' может разрешать Samsung, Yageo и Vishay.
+    """
+    __tablename__ = "bom_item_alternatives"
+
+    id = Column(Integer, primary_key=True)
+    bom_item_id = Column(Integer, ForeignKey("product_boms.id", ondelete="CASCADE"), nullable=False, index=True)
+    component_id = Column(Integer, ForeignKey("components.id"), nullable=False, index=True)
+    is_primary = Column(Boolean, default=False, nullable=False)
+    note = Column(String, nullable=True)
+
+    bom_item = relationship("ProductBOM", back_populates="alternatives")
+    component = relationship("Component")
 
 
 class Order(Base):

@@ -9,8 +9,8 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.models.production import ProductType, ProductBOM, BOMMapping
-from app.models.inventory import Component
+from app.models.production import ProductType, ProductBOM, BOMMapping, BOMItemAlternative
+from app.models.inventory import Component, Stock
 from app.schemas.production import ProductCreateSchema, BOMItemCreate, BOMUploadResponse
 from app.services.bom_service import BOMMatchingService
 from app.services.auth_service import require_roles
@@ -45,6 +45,12 @@ class BOMManualItemSchema(BaseModel):
     operation_role: Optional[str] = None
     sort_order: Optional[int] = 0
     is_resolved: Optional[bool] = False
+
+
+class BOMAlternativeCreate(BaseModel):
+    component_id: int
+    note: Optional[str] = None
+    is_primary: Optional[bool] = False
 
 
 class ProductUpdate(BaseModel):
@@ -130,17 +136,63 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 
 # --- Эндпоинты ---
 
-def _item_payload(item: ProductBOM, warehouse_cache: dict, products_cache: dict):
+def _alternative_payload(alternative: BOMItemAlternative, stock_cache: dict):
+    component = alternative.component
+    if not component:
+        return None
+    return {
+        "id": alternative.id,
+        "component_id": component.id,
+        "name": component.name,
+        "part_number": component.part_number,
+        "category": component.category,
+        "package": component.package,
+        "value": component.value,
+        "quantity": stock_cache.get(component.id, 0.0),
+        "is_primary": alternative.is_primary,
+        "note": alternative.note,
+    }
+
+
+def _item_payload(item: ProductBOM, warehouse_cache: dict, products_cache: dict, stock_cache: dict):
     item_type = item.item_type or ("assembly" if item.resource_type in ["product", "subassembly"] else "component")
     resource = None
     if item.resource_type == "component":
         comp = warehouse_cache.get(item.resource_id)
         if comp:
-            resource = {"id": comp.id, "name": comp.name, "part_number": comp.part_number}
+            resource = {
+                "id": comp.id,
+                "name": comp.name,
+                "part_number": comp.part_number,
+                "quantity": stock_cache.get(comp.id, 0.0),
+            }
     elif item.resource_type in ["product", "subassembly"]:
         sub_prod = products_cache.get(item.resource_id)
         if sub_prod:
             resource = {"id": sub_prod.id, "name": sub_prod.name, "drawing_number": sub_prod.drawing_number}
+
+    alternatives = []
+    seen_components = set()
+    primary_component = warehouse_cache.get(item.resource_id) if item.resource_type == "component" else None
+    if primary_component:
+        alternatives.append({
+            "id": None,
+            "component_id": primary_component.id,
+            "name": primary_component.name,
+            "part_number": primary_component.part_number,
+            "category": primary_component.category,
+            "package": primary_component.package,
+            "value": primary_component.value,
+            "quantity": stock_cache.get(primary_component.id, 0.0),
+            "is_primary": True,
+            "note": "Основная привязка",
+        })
+        seen_components.add(primary_component.id)
+    for alternative in item.alternatives or []:
+        payload = _alternative_payload(alternative, stock_cache)
+        if payload and payload["component_id"] not in seen_components:
+            alternatives.append(payload)
+            seen_components.add(payload["component_id"])
 
     return {
         "id": item.id,
@@ -156,12 +208,13 @@ def _item_payload(item: ProductBOM, warehouse_cache: dict, products_cache: dict)
         "quantity": item.quantity,
         "is_resolved": item.is_resolved,
         "resource": resource,
+        "alternatives": alternatives,
         "children": [],
     }
 
 
-def _build_tree(items: list[ProductBOM], warehouse_cache: dict, products_cache: dict):
-    nodes = {_item.id: _item_payload(_item, warehouse_cache, products_cache) for _item in items}
+def _build_tree(items: list[ProductBOM], warehouse_cache: dict, products_cache: dict, stock_cache: dict):
+    nodes = {_item.id: _item_payload(_item, warehouse_cache, products_cache, stock_cache) for _item in items}
     roots = []
     for item in sorted(items, key=lambda row: (row.parent_id or 0, row.sort_order or 0, row.id)):
         node = nodes[item.id]
@@ -171,15 +224,33 @@ def _build_tree(items: list[ProductBOM], warehouse_cache: dict, products_cache: 
             roots.append(node)
     return roots
 
+
+def _ensure_primary_alternative(db: Session, item: ProductBOM, component_id: int):
+    db.query(BOMItemAlternative).filter(BOMItemAlternative.bom_item_id == item.id).update({"is_primary": False})
+    alternative = db.query(BOMItemAlternative).filter(
+        BOMItemAlternative.bom_item_id == item.id,
+        BOMItemAlternative.component_id == component_id
+    ).first()
+    if not alternative:
+        alternative = BOMItemAlternative(bom_item_id=item.id, component_id=component_id)
+        db.add(alternative)
+    alternative.is_primary = True
+    return alternative
+
 @router.get("/products")
 def get_all_products(
     db: Session = Depends(get_db),
     _=Depends(require_roles("admin", "engineer", "manager", "production", "warehouse", "assembler", "tester", "repair_engineer")),
 ):
     """Получение всех изделий с группировкой по категориям компонентов."""
-    products = db.query(ProductType).options(selectinload(ProductType.components)).all()
+    products = db.query(ProductType).options(
+        selectinload(ProductType.components)
+        .selectinload(ProductBOM.alternatives)
+        .selectinload(BOMItemAlternative.component)
+    ).all()
     warehouse_cache = {c.id: c for c in db.query(Component).all()}
     products_cache = {p.id: p for p in db.query(ProductType).all()}
+    stock_cache = {stock.component_id: stock.actual_qty for stock in db.query(Stock).filter(Stock.component_id.isnot(None)).all()}
 
     result = []
     for product in products:
@@ -189,12 +260,7 @@ def get_all_products(
             if item.parent_id:
                 continue
             item_type = item.item_type or ("assembly" if item.resource_type in ["product", "subassembly"] else "component")
-            item_data = {
-                **item.__dict__,
-                "item_type": item_type,
-                "resource": None,
-                "children": []
-            }
+            item_data = _item_payload(item, warehouse_cache, products_cache, stock_cache)
             section = "Непривязанные компоненты"
 
             # СТРОГАЯ ПРОВЕРКА: Если тип "component", смотрим ТОЛЬКО на склад
@@ -204,7 +270,6 @@ def get_all_products(
             elif item.resource_type == "component":
                 comp = warehouse_cache.get(item.resource_id)
                 if comp:
-                    item_data["resource"] = {"id": comp.id, "name": comp.name, "part_number": comp.part_number}
                     section = getattr(comp, "category", "Прочие складские компоненты")
 
             # Если тип узел/изделие, смотрим ТОЛЬКО в каталог изделий
@@ -228,7 +293,7 @@ def get_all_products(
             "is_subassembly": product.is_subassembly,
             "photo_url": product.photo_url,
             "attachments": product.attachments or [],
-            "tree": _build_tree(product_items, warehouse_cache, products_cache),
+            "tree": _build_tree(product_items, warehouse_cache, products_cache, stock_cache),
             "sections": sections
         })
     return result
@@ -482,6 +547,8 @@ def update_bom_item(
         item.resource_id = data.resource_id
         item.resource_type = data.resource_type if data.resource_type != "raw_string" else "component"
         item.is_resolved = True
+        if item.resource_type == "component":
+            _ensure_primary_alternative(db, item, item.resource_id)
 
         if item.resource_type == "component":
             mapping = db.query(BOMMapping).filter(BOMMapping.design_name == item.design_name).first()
@@ -496,6 +563,7 @@ def update_bom_item(
         item.resource_id = None
         item.resource_type = "raw_string"
         item.is_resolved = False
+        db.query(BOMItemAlternative).filter(BOMItemAlternative.bom_item_id == item.id).delete()
 
     db.commit()
     return {
@@ -511,6 +579,117 @@ def update_bom_item(
     }
 
 
+@router.post("/bom-items/{item_id}/alternatives")
+def add_bom_item_alternative(
+    item_id: int,
+    data: BOMAlternativeCreate,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
+    """Добавляет разрешенный складской аналог к строке состава."""
+    item = db.query(ProductBOM).get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    if (item.item_type or "component") != "component":
+        raise HTTPException(status_code=400, detail="Аналоги можно добавлять только к покупным позициям")
+
+    component = db.query(Component).get(data.component_id)
+    if not component:
+        raise HTTPException(status_code=404, detail="Компонент склада не найден")
+
+    existing = db.query(BOMItemAlternative).filter(
+        BOMItemAlternative.bom_item_id == item.id,
+        BOMItemAlternative.component_id == component.id
+    ).first()
+    if existing:
+        if data.note is not None:
+            existing.note = data.note
+        if data.is_primary:
+            item.resource_id = component.id
+            item.resource_type = "component"
+            item.is_resolved = True
+            _ensure_primary_alternative(db, item, component.id)
+        db.commit()
+        return {"status": "success", "alternative_id": existing.id}
+
+    if data.is_primary or not item.resource_id:
+        item.resource_id = component.id
+        item.resource_type = "component"
+        item.is_resolved = True
+        alternative = _ensure_primary_alternative(db, item, component.id)
+        alternative.note = data.note
+    else:
+        alternative = BOMItemAlternative(
+            bom_item_id=item.id,
+            component_id=component.id,
+            is_primary=False,
+            note=data.note
+        )
+        db.add(alternative)
+
+    db.commit()
+    return {"status": "success", "alternative_id": alternative.id}
+
+
+@router.put("/bom-items/{item_id}/alternatives/{component_id}/primary")
+def set_bom_item_primary_alternative(
+    item_id: int,
+    component_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
+    """Делает аналог основной складской привязкой строки состава."""
+    item = db.query(ProductBOM).get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    component = db.query(Component).get(component_id)
+    if not component:
+        raise HTTPException(status_code=404, detail="Компонент склада не найден")
+
+    item.resource_id = component.id
+    item.resource_type = "component"
+    item.item_type = "component"
+    item.is_resolved = True
+    _ensure_primary_alternative(db, item, component.id)
+    db.commit()
+    return {"status": "success"}
+
+
+@router.delete("/bom-items/{item_id}/alternatives/{component_id}")
+def delete_bom_item_alternative(
+    item_id: int,
+    component_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "engineer")),
+):
+    """Удаляет разрешенный аналог. Если удаляется основной, строка остается без привязки."""
+    item = db.query(ProductBOM).get(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+
+    db.query(BOMItemAlternative).filter(
+        BOMItemAlternative.bom_item_id == item.id,
+        BOMItemAlternative.component_id == component_id
+    ).delete()
+    if item.resource_type == "component" and item.resource_id == component_id:
+        next_alt = db.query(BOMItemAlternative).filter(
+            BOMItemAlternative.bom_item_id == item.id,
+            BOMItemAlternative.component_id != component_id
+        ).first()
+        if next_alt:
+            item.resource_id = next_alt.component_id
+            item.resource_type = "component"
+            item.is_resolved = True
+            _ensure_primary_alternative(db, item, next_alt.component_id)
+        else:
+            item.resource_id = None
+            item.resource_type = "raw_string"
+            item.is_resolved = False
+
+    db.commit()
+    return {"status": "success"}
+
+
 @router.delete("/products/{product_id}")
 def delete_product(
     product_id: int,
@@ -522,9 +701,18 @@ def delete_product(
     if not product:
         raise HTTPException(status_code=404, detail="Изделие не найдено")
 
-    db.query(ProductBOM).filter(ProductBOM.resource_id == product_id,
-                                ProductBOM.resource_type.in_(["product", "subassembly"])).delete()
-    db.query(ProductBOM).filter(ProductBOM.product_id == product_id).delete()
+    linked_bom_ids = [
+        row.id for row in db.query(ProductBOM.id).filter(
+            ProductBOM.resource_id == product_id,
+            ProductBOM.resource_type.in_(["product", "subassembly"])
+        ).all()
+    ]
+    own_bom_ids = [row.id for row in db.query(ProductBOM.id).filter(ProductBOM.product_id == product_id).all()]
+    bom_ids = linked_bom_ids + own_bom_ids
+    if bom_ids:
+        db.query(BOMItemAlternative).filter(BOMItemAlternative.bom_item_id.in_(bom_ids)).delete(synchronize_session=False)
+    db.query(ProductBOM).filter(ProductBOM.id.in_(linked_bom_ids)).delete(synchronize_session=False)
+    db.query(ProductBOM).filter(ProductBOM.id.in_(own_bom_ids)).delete(synchronize_session=False)
     db.delete(product)
     db.commit()
     return {"status": "success"}
@@ -550,6 +738,8 @@ def delete_bom_item(
         return ids
 
     descendant_ids = collect_descendant_ids(item.id)
+    delete_ids = descendant_ids + [item.id]
+    db.query(BOMItemAlternative).filter(BOMItemAlternative.bom_item_id.in_(delete_ids)).delete(synchronize_session=False)
     if descendant_ids:
         db.query(ProductBOM).filter(ProductBOM.id.in_(descendant_ids)).delete(synchronize_session=False)
     db.delete(item)

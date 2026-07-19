@@ -35,6 +35,20 @@ with engine.begin() as conn:
     order_columns = {column["name"] for column in inspect(conn).get_columns("orders")}
     if "planned_delivery_date" not in order_columns:
         conn.execute(text("ALTER TABLE orders ADD COLUMN planned_delivery_date DATETIME"))
+    if not inspect(conn).has_table("bom_item_alternatives"):
+        conn.execute(text("""
+            CREATE TABLE bom_item_alternatives (
+                id INTEGER NOT NULL PRIMARY KEY,
+                bom_item_id INTEGER NOT NULL,
+                component_id INTEGER NOT NULL,
+                is_primary BOOLEAN NOT NULL DEFAULT 0,
+                note VARCHAR,
+                FOREIGN KEY(bom_item_id) REFERENCES product_boms (id) ON DELETE CASCADE,
+                FOREIGN KEY(component_id) REFERENCES components (id)
+            )
+        """))
+        conn.execute(text("CREATE INDEX ix_bom_item_alternatives_bom_item_id ON bom_item_alternatives (bom_item_id)"))
+        conn.execute(text("CREATE INDEX ix_bom_item_alternatives_component_id ON bom_item_alternatives (component_id)"))
 with SessionLocal() as db:
     ensure_default_admin(db)
 
