@@ -43,6 +43,36 @@ def _phone_username(phone: str) -> str:
     return f"phone_{cleaned}" if cleaned else phone
 
 
+def _normalize_phone(value: str | None) -> str | None:
+    value = _clean(value)
+    if not value:
+        return None
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) == 10:
+        return f"+7{digits}"
+    if len(digits) == 11 and digits.startswith("8"):
+        return f"+7{digits[1:]}"
+    if len(digits) == 11 and digits.startswith("7"):
+        return f"+{digits}"
+    return value
+
+
+def _phone_lookup_values(value: str | None) -> list[str]:
+    raw = _clean(value)
+    normalized = _normalize_phone(value)
+    digits = "".join(ch for ch in raw or "" if ch.isdigit())
+    values = [normalized, raw]
+    if len(digits) == 10:
+        values.extend([digits, f"8{digits}", f"7{digits}", f"+7{digits}"])
+    elif len(digits) == 11:
+        values.extend([digits, f"+{digits}"])
+        if digits.startswith("7"):
+            values.append(f"8{digits[1:]}")
+        if digits.startswith("8"):
+            values.append(f"+7{digits[1:]}")
+    return list(dict.fromkeys(value for value in values if value))
+
+
 def _validate_roles(roles: list[str] | None, fallback: str | None = None) -> list[str]:
     cleaned = []
     for role in roles or []:
@@ -73,11 +103,11 @@ def _user_out(user: User) -> UserOut:
 
 @router.post("/auth/login", response_model=TokenResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    identity = _clean(payload.phone) or _clean(payload.username)
+    identity = _normalize_phone(payload.phone) or _clean(payload.username)
     if not identity:
         raise HTTPException(status_code=422, detail="Укажите телефон")
 
-    user = db.query(User).filter(User.phone == identity).first()
+    user = db.query(User).filter(User.phone.in_(_phone_lookup_values(identity))).first()
     if not user:
         user = db.query(User).filter(User.username == identity).first()
     if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
@@ -129,7 +159,7 @@ def list_active_users(
 def create_user(payload: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_roles("admin"))):
     roles = _validate_roles(payload.roles, payload.role)
     primary_role = roles[0]
-    phone = _clean(payload.phone)
+    phone = _normalize_phone(payload.phone)
     if not phone:
         raise HTTPException(status_code=422, detail="Телефон обязателен")
 
@@ -181,7 +211,7 @@ def update_user(
     if payload.middle_name is not None:
         user.middle_name = _clean(payload.middle_name)
     if payload.phone is not None:
-        phone = _clean(payload.phone)
+        phone = _normalize_phone(payload.phone)
         if phone:
             existing = db.query(User).filter(User.phone == phone, User.id != user.id).first()
             if existing:
