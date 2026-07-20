@@ -57,6 +57,7 @@ class ProductUpdate(BaseModel):
     name: str
     drawing_number: Optional[str] = None
     revision: Optional[str] = "1.0"
+    test_checklist: Optional[list[str]] = None
 
 
 def _safe_filename(filename: str):
@@ -98,7 +99,8 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
         name=data.name,
         drawing_number=data.drawing_number,
         revision=data.version,
-        is_subassembly=is_subassembly
+        is_subassembly=is_subassembly,
+        test_checklist=[item.strip() for item in (data.test_checklist or []) if item.strip()],
     )
     db.add(new_product)
     db.flush()
@@ -293,6 +295,7 @@ def get_all_products(
             "is_subassembly": product.is_subassembly,
             "photo_url": product.photo_url,
             "attachments": product.attachments or [],
+            "test_checklist": product.test_checklist or [],
             "tree": _build_tree(product_items, warehouse_cache, products_cache, stock_cache),
             "sections": sections
         })
@@ -331,6 +334,8 @@ def update_product(
     product.name = data.name.strip()
     product.drawing_number = data.drawing_number
     product.revision = data.revision or "1.0"
+    if data.test_checklist is not None:
+        product.test_checklist = [item.strip() for item in data.test_checklist if item and item.strip()]
     db.commit()
     db.refresh(product)
     return product

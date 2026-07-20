@@ -86,6 +86,7 @@ class ProductCreateSchema(BaseModel):
     drawing_number: str = Field(..., example="РСДТ.421243.320", description="Децимальный номер чертежа")
     version: str = Field(default="1", description="Версия КД или ревизия платы")
     is_final: bool = Field(default=False, description="True, если это готовый продукт для продажи")
+    test_checklist: List[str] = Field(default_factory=list, description="Пункты проверки изделия")
 
     # Рекурсивный список всех компонентов и узлов
     components: List[BOMItemCreate] = Field(default_factory=list)

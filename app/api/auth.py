@@ -13,6 +13,7 @@ from app.services.auth_service import (
     hash_password,
     permissions_for_roles,
     require_roles,
+    user_has_role,
     user_roles,
     verify_password,
 )
@@ -149,7 +150,7 @@ def list_active_users(
         _validate_role(role)
         users = [
             user for user in query.order_by(User.full_name, User.username).all()
-            if role in user_roles(user)
+            if role in user_roles(user) or user_has_role(user, "admin", "manager")
         ]
         return [_user_out(user) for user in users]
     return [_user_out(user) for user in query.order_by(User.full_name, User.username).all()]

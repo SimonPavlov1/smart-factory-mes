@@ -46,6 +46,7 @@ class ProductType(Base):
     bill_of_materials_url = Column(String, nullable=True, comment="Путь к чертежам, PDF или исходникам проекта.")
     photo_url = Column(String, nullable=True, comment="Фото или рендер изделия для карточки")
     attachments = Column(JSON, default=list, comment="Файлы КД, сборочные чертежи, составы и прочая документация")
+    test_checklist = Column(JSON, default=list, comment="Пункты проверки изделия для задач тестирования")
     description = Column(Text, nullable=True, comment="Технические особенности или нюансы сборки.")
 
     # Связи
@@ -207,6 +208,7 @@ class WorkflowTask(Base):
     status = Column(String, default="assigned", index=True, nullable=False)
     assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     payload = Column(JSON, nullable=True)
+    sort_order = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     due_date = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

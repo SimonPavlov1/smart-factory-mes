@@ -16,7 +16,7 @@ from app.models.inventory import Stock, Component  # Component использу�
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
 from app.services.auth_service import require_roles, user_roles
-from app.services.workflow_service import complete_task, create_initial_order_tasks, find_order_shortages, find_shortages
+from app.services.workflow_service import complete_task, create_initial_order_tasks, create_procurement_task_for_order, find_order_shortages, find_shortages, plan_material_availability, reconcile_stock_reservations
 from app.services.xlsx_service import build_table_xlsx
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
@@ -47,7 +47,7 @@ ORDER_STAGES = [
         "key": "warehouse_issue",
         "title": "Выдача комплектующих",
         "description": "Передача комплекта сборщику",
-        "task_types": ["warehouse_issue_materials"],
+        "task_types": ["warehouse_issue_materials", "repair_issue_materials"],
     },
     {
         "key": "assembler_receive",
@@ -379,8 +379,10 @@ def _stage_status(tasks: list[WorkflowTask]) -> str:
         return "not_created"
     if all(task.status == "done" for task in tasks):
         return "done"
-    if any(task.status == "in_progress" for task in tasks):
+    if any(task.status in ["in_progress", "ready_to_issue"] for task in tasks):
         return "in_progress"
+    if any(task.status == "hold" for task in tasks):
+        return "hold"
     if any(task.status in ["assigned", "open", "waiting_delivery"] for task in tasks):
         return "assigned"
     return tasks[-1].status or "assigned"
@@ -473,6 +475,7 @@ def create_production_order(
         raise HTTPException(status_code=400, detail="Заказ должен содержать хотя бы одно изделие")
 
     try:
+        reconcile_stock_reservations(db)
         for item in payload.items:
             if item.quantity <= 0:
                 raise HTTPException(status_code=400, detail="Количество изделия должно быть больше нуля")
@@ -494,20 +497,58 @@ def create_production_order(
             )
             db.add(order_item)
             order_items.append(order_item)
+        db.flush()
 
-        total_needed_items = _calculate_materials_for_items(order_items, db)
-        materials_list = _materials_list(total_needed_items)
-        shortages = find_shortages(db, materials_list)
+        all_materials = []
+        product_contexts = {}
+        for order_item in order_items:
+            product = db.query(ProductType).filter(ProductType.id == order_item.product_id).first()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Изделие ID {order_item.product_id} не найдено")
+            product_context = {
+                "order_item_id": order_item.id,
+                "product_id": product.id,
+                "product_name": product.name,
+                "drawing_number": product.drawing_number,
+                "qty": order_item.quantity,
+            }
+            product_contexts[order_item.id] = product_context
+            materials_list = [
+                {**material, **product_context}
+                for material in get_bom_requirements(order_item.product_id, order_item.quantity, db)
+            ]
+            all_materials.extend(materials_list)
 
-        create_initial_order_tasks(db, new_order, materials_list, shortages)
+        available_lines, all_shortages = plan_material_availability(db, all_materials)
+        available_by_item = {}
+        shortages_by_item = {}
+        materials_by_item = {}
+        for line in all_materials:
+            materials_by_item.setdefault(line.get("order_item_id"), []).append(line)
+        for line in available_lines:
+            available_by_item.setdefault(line.get("order_item_id"), []).append(line)
+        for line in all_shortages:
+            shortages_by_item.setdefault(line.get("order_item_id"), []).append(line)
+
+        for order_item in order_items:
+            create_initial_order_tasks(
+                db,
+                new_order,
+                materials_by_item.get(order_item.id, []),
+                shortages_by_item.get(order_item.id, []),
+                product_context=product_contexts.get(order_item.id),
+                create_procurement=False,
+                available_materials=available_by_item.get(order_item.id, []),
+            )
+        create_procurement_task_for_order(db, new_order, all_shortages)
 
         db.commit()
         return {
             "status": "success",
             "order_id": new_order.id,
             "order_status": new_order.status,
-            "details": materials_list,
-            "shortages": shortages,
+            "details": all_materials,
+            "shortages": all_shortages,
         }
 
     except HTTPException:
@@ -527,6 +568,8 @@ def get_production_order_detail(
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
+    reconcile_stock_reservations(db)
+    db.flush()
     return _order_payload(order, db)
 
 
@@ -541,11 +584,10 @@ def delete_production_order(
         raise HTTPException(status_code=404, detail="Заказ не найден")
 
     reservations = db.query(Reservation).filter(Reservation.order_id == order_id).all()
-    if order.status in ["Reserved", "In Progress", "Procurement Required"]:
-        for reservation in reservations:
-            stock = db.query(Stock).filter(Stock.component_id == reservation.component_id).first()
-            if stock:
-                stock.reserved_qty = max((stock.reserved_qty or 0) - reservation.qty, 0)
+    for reservation in reservations:
+        stock = db.query(Stock).filter(Stock.component_id == reservation.component_id).first()
+        if stock:
+            stock.reserved_qty = max((stock.reserved_qty or 0) - reservation.qty, 0)
 
     db.query(WorkflowTask).filter(WorkflowTask.order_id == order_id).delete(synchronize_session=False)
     db.query(Item).filter(Item.order_id == order_id).delete(synchronize_session=False)
@@ -568,13 +610,13 @@ def issue_materials_for_order(
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
-    if order.status not in ["In Progress", "Reserved"]:
+    if order.status not in ["In Progress", "Reserved", "Components Available"]:
         raise HTTPException(status_code=400, detail="Материалы уже выданы или заказ завершен")
 
     issue_task = db.query(WorkflowTask).filter(
         WorkflowTask.order_id == order_id,
         WorkflowTask.type == "warehouse_issue_materials",
-        WorkflowTask.status.in_(["assigned", "in_progress", "open"]),
+        WorkflowTask.status.in_(["in_progress", "open"]),
     ).order_by(WorkflowTask.id).first()
     if issue_task:
         try:
