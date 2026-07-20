@@ -2,14 +2,24 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import String, and_, cast, or_
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from pydantic import BaseModel, Field
 
 from app.database import get_db
-from app.models.inventory import Component, Stock
+from app.models.auth import User
+from app.models.inventory import Component, InventoryMovement, Stock
+from app.models.production import ProductType, WorkflowTask
 from app.schemas.inventory import ComponentCreate
 from app.services.auth_service import require_roles
+from app.services.inventory_movement_service import record_movement
 
 router = APIRouter(tags=["Склад (Inventory)"])
 INVENTORY_READ_ROLES = ("admin", "warehouse", "manager", "engineer", "production", "procurement")
+
+
+class FinishedGoodsIssue(BaseModel):
+    quantity: float = Field(gt=0)
+    recipient: str = Field(min_length=1, max_length=255)
+    note: Optional[str] = Field(None, max_length=1000)
 
 
 def _component_payload(component: Component, quantity: float = 0.0):
@@ -43,6 +53,109 @@ def _apply_component_search(query, search: Optional[str]):
             ))
         query = query.filter(and_(*conditions))
     return query
+
+
+def _movement_payload(movement: InventoryMovement, users: dict[int, User], tasks: dict[int, WorkflowTask]):
+    actor = users.get(movement.actor_user_id)
+    counterparty = users.get(movement.counterparty_user_id)
+    task = tasks.get(movement.task_id)
+    return {
+        "id": movement.id,
+        "component_id": movement.component_id,
+        "product_id": movement.product_id,
+        "direction": movement.direction,
+        "quantity": movement.quantity,
+        "balance_after": movement.balance_after,
+        "location": movement.location,
+        "task_id": movement.task_id,
+        "task_title": task.title if task else None,
+        "order_id": movement.order_id,
+        "actor_user_id": movement.actor_user_id,
+        "actor_name": (actor.full_name or actor.username) if actor else None,
+        "counterparty_user_id": movement.counterparty_user_id,
+        "counterparty_name": (counterparty.full_name or counterparty.username) if counterparty else None,
+        "counterparty_role": movement.counterparty_role,
+        "recipient": movement.recipient,
+        "note": movement.note,
+        "created_at": movement.created_at,
+    }
+
+
+@router.get("/movements")
+def get_inventory_movements(
+    component_id: Optional[int] = Query(None),
+    product_id: Optional[int] = Query(None),
+    before_id: Optional[int] = Query(None, ge=1),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES, "packer")),
+):
+    query = db.query(InventoryMovement)
+    if component_id is not None:
+        query = query.filter(InventoryMovement.component_id == component_id)
+    if product_id is not None:
+        query = query.filter(InventoryMovement.product_id == product_id)
+    if before_id is not None:
+        query = query.filter(InventoryMovement.id < before_id)
+    movements = query.order_by(InventoryMovement.id.desc()).limit(limit + 1).all()
+    page = movements[:limit]
+    user_ids = {value for movement in page for value in (movement.actor_user_id, movement.counterparty_user_id) if value}
+    task_ids = {movement.task_id for movement in page if movement.task_id}
+    users = {user.id: user for user in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+    tasks = {task.id: task for task in db.query(WorkflowTask).filter(WorkflowTask.id.in_(task_ids)).all()} if task_ids else {}
+    return {
+        "items": [_movement_payload(movement, users, tasks) for movement in page],
+        "next_cursor": page[-1].id if len(movements) > limit and page else None,
+        "has_more": len(movements) > limit,
+    }
+
+
+@router.get("/finished-goods")
+def get_finished_goods(
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "warehouse", "manager", "production", "packer")),
+):
+    query = db.query(Stock, ProductType).join(ProductType, Stock.product_id == ProductType.id).filter(Stock.product_id.isnot(None))
+    if search and search.strip():
+        pattern = f"%{search.strip()}%"
+        query = query.filter(or_(ProductType.name.ilike(pattern), ProductType.sku.ilike(pattern), ProductType.drawing_number.ilike(pattern)))
+    return [{
+        "product_id": product.id,
+        "name": product.name,
+        "sku": product.sku,
+        "drawing_number": product.drawing_number,
+        "quantity": stock.actual_qty or 0,
+        "location": stock.location,
+    } for stock, product in query.order_by(ProductType.name).all()]
+
+
+@router.post("/finished-goods/{product_id}/issue")
+def issue_finished_goods(
+    product_id: int,
+    payload: FinishedGoodsIssue,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "warehouse")),
+):
+    stock = db.query(Stock).filter(Stock.product_id == product_id).with_for_update().first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Готовая продукция не найдена на складе")
+    if (stock.actual_qty or 0) < payload.quantity:
+        raise HTTPException(status_code=400, detail=f"Недостаточно готовой продукции. Доступно: {stock.actual_qty or 0}")
+    stock.actual_qty -= payload.quantity
+    record_movement(
+        db,
+        direction="outgoing",
+        quantity=payload.quantity,
+        balance_after=stock.actual_qty,
+        product_id=product_id,
+        location=stock.location,
+        actor_user_id=user.id,
+        recipient=payload.recipient,
+        note=payload.note or "Выдача готовой продукции",
+    )
+    db.commit()
+    return {"status": "success", "new_qty": stock.actual_qty}
 
 
 @router.post("/components")

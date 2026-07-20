@@ -3,9 +3,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from app.models.auth import User
 from app.models.production import WorkflowTask
 from app.services.auth_service import get_current_user, require_roles, user_has_role, user_roles
 from app.services.workflow_service import add_procurement_purchase, complete_task, enrich_component_lines
+from app.services.xlsx_service import build_table_xlsx
 
 router = APIRouter(prefix="/tasks", tags=["Workflow задачи"])
 UPLOAD_ROOT = Path("uploads/tasks")
@@ -68,6 +70,16 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
             payload["materials"] = enrich_component_lines(db, payload["materials"])
         if payload.get("purchases"):
             payload["purchases"] = enrich_component_lines(db, payload["purchases"])
+        if payload.get("ordered_items"):
+            payload["ordered_items"] = enrich_component_lines(db, payload["ordered_items"])
+        if payload.get("receipt_history"):
+            payload["receipt_history"] = [
+                {
+                    **entry,
+                    "items": enrich_component_lines(db, entry.get("items") or []),
+                }
+                for entry in payload["receipt_history"]
+            ]
     return {
         "id": task.id,
         "order_id": task.order_id,
@@ -92,6 +104,48 @@ def _can_access_task(task: WorkflowTask, user: User):
     if task.assigned_user_id:
         return task.assigned_user_id == user.id
     return task.role in user_roles(user)
+
+
+@router.get("/{task_id}/form.xlsx")
+def download_material_task_form(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    task = db.query(WorkflowTask).filter(WorkflowTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if not _can_access_task(task, user):
+        raise HTTPException(status_code=403, detail="Эта задача назначена другой роли")
+    if task.type not in ["warehouse_issue_materials", "assembler_receive_materials"]:
+        raise HTTPException(status_code=400, detail="Для этой задачи форма не предусмотрена")
+
+    materials = enrich_component_lines(db, (task.payload or {}).get("materials") or [])
+    is_issue = task.type == "warehouse_issue_materials"
+    action = "Выдача" if is_issue else "Получение"
+    rows = [[
+        index,
+        material.get("component_name") or f"Компонент ID {material['component_id']}",
+        material.get("part_number") or "—",
+        material.get("category") or "—",
+        float(material.get("qty") or 0),
+        "",
+        "",
+    ] for index, material in enumerate(materials, start=1)]
+    workbook = build_table_xlsx(
+        sheet_name=action,
+        title=f"Форма: {action.lower()} комплектующих",
+        metadata=[("Заказ", f"№ {task.order_id}"), ("Задача", f"№ {task.id}"), ("Статус", task.status)],
+        headers=["№", "Наименование", "Артикул", "Категория", "По заданию", "Фактически", "Примечание / подпись"],
+        rows=rows,
+        widths=[7, 46, 28, 24, 14, 14, 30],
+    )
+    filename = f"{action} комплектующих заказ {task.order_id}.xlsx"
+    return StreamingResponse(
+        workbook,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 def _can_work_task(task: WorkflowTask, user: User):
@@ -352,6 +406,6 @@ def complete_workflow_task(
     if task.status not in ["in_progress", "open"] or not _can_work_task(task, user):
         raise HTTPException(status_code=400, detail="Сначала задачу нужно взять в работу")
 
-    result = complete_task(db, task, payload.payload)
+    result = complete_task(db, task, payload.payload, actor_user_id=user.id)
     db.commit()
     return {"status": "success", "task_id": task.id, "result": result}

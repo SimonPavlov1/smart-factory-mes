@@ -4,10 +4,11 @@ from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.models.inventory import Component, Stock
+from app.models.inventory import Component, InventoryMovement, Stock
 from app.models.production import Order, OrderItem, Reservation, WorkflowTask
 from app.services.production_planning import get_bom_requirements
 from app.services.reservation_service import reserve_components
+from app.services.inventory_movement_service import record_movement
 
 
 def create_task(db: Session, *, order_id: int, task_type: str, title: str, role: str,
@@ -79,6 +80,19 @@ def find_shortages(db: Session, materials: list[dict]) -> list[dict]:
     return shortages
 
 
+def _available_materials(materials: list[dict], shortages: list[dict]) -> list[dict]:
+    shortage_map = {
+        int(line["component_id"]): float(line.get("shortage_qty") or 0)
+        for line in shortages
+    }
+    result = []
+    for material in materials:
+        qty = float(material.get("qty") or 0) - shortage_map.get(int(material["component_id"]), 0)
+        if qty > 0:
+            result.append({"component_id": int(material["component_id"]), "qty": qty})
+    return result
+
+
 def _line_qty_map(items: list[dict]) -> dict[int, float]:
     result = {}
     for item in items or []:
@@ -105,8 +119,8 @@ def _delivery_lines(completion_payload: dict) -> list[dict]:
                 "qty": qty,
                 "expected_date": delivery.get("expected_date") or completion_payload.get("expected_date"),
                 "invoice": delivery.get("invoice") or completion_payload.get("invoice"),
-                "supplier": delivery.get("supplier"),
-                "comment": delivery.get("comment"),
+                "supplier": delivery.get("supplier") or completion_payload.get("supplier"),
+                "comment": delivery.get("comment") or completion_payload.get("comment"),
             })
         return result
 
@@ -181,7 +195,8 @@ def _split_component_lines(lines: list[dict], accepted_qty: dict[int, float]) ->
     return accepted, remaining
 
 
-def _receive_components_to_stock(db: Session, lines: list[dict]):
+def _receive_components_to_stock(db: Session, lines: list[dict], task: WorkflowTask | None = None,
+                                 actor_user_id: int | None = None):
     for line in lines:
         component_id = int(line["component_id"])
         qty = float(line.get("qty") or line.get("shortage_qty") or 0)
@@ -191,7 +206,21 @@ def _receive_components_to_stock(db: Session, lines: list[dict]):
         if stock:
             stock.actual_qty = (stock.actual_qty or 0) + qty
         else:
-            db.add(Stock(component_id=component_id, actual_qty=qty, location="Warehouse-1"))
+            stock = Stock(component_id=component_id, actual_qty=qty, location="Warehouse-1")
+            db.add(stock)
+        record_movement(
+            db,
+            direction="incoming",
+            quantity=qty,
+            balance_after=stock.actual_qty,
+            component_id=component_id,
+            location=stock.location,
+            task_id=task.id if task else None,
+            order_id=task.order_id if task else None,
+            actor_user_id=actor_user_id,
+            recipient=(task.payload or {}).get("supplier") if task else None,
+            note="Приёмка комплектующих на склад",
+        )
 
 
 def _update_procurement_purchase_receipt(db: Session, payload: dict, received: list[dict]):
@@ -238,12 +267,125 @@ def _calculate_order_materials(db: Session, order_id: int) -> list[dict]:
     return list(total.values())
 
 
+def _issued_qty_map(db: Session, order_id: int) -> dict[int, float]:
+    result = {}
+    tasks = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "warehouse_issue_materials",
+        WorkflowTask.status == "done",
+    ).all()
+    for task in tasks:
+        for line in (task.payload or {}).get("materials", []):
+            component_id = int(line["component_id"])
+            result[component_id] = result.get(component_id, 0) + float(line.get("qty") or 0)
+    return result
+
+
+def _remaining_order_materials(db: Session, order_id: int) -> list[dict]:
+    issued = _issued_qty_map(db, order_id)
+    remaining = []
+    for material in _calculate_order_materials(db, order_id):
+        qty = max(float(material["qty"]) - issued.get(int(material["component_id"]), 0), 0)
+        if qty > 0:
+            remaining.append({"component_id": int(material["component_id"]), "qty": qty})
+    return remaining
+
+
+def get_order_remaining_materials(db: Session, order_id: int) -> list[dict]:
+    """Public read model for requirements not yet physically issued to assembly."""
+    return _remaining_order_materials(db, order_id)
+
+
+def find_order_shortages(db: Session, order_id: int) -> list[dict]:
+    materials = _remaining_order_materials(db, order_id)
+    component_ids = [material["component_id"] for material in materials]
+    components = {
+        component.id: component
+        for component in db.query(Component).filter(Component.id.in_(component_ids)).all()
+    } if component_ids else {}
+    own_reservations = {}
+    for reservation in db.query(Reservation).filter(Reservation.order_id == order_id).all():
+        own_reservations[reservation.component_id] = own_reservations.get(reservation.component_id, 0) + float(reservation.qty)
+
+    shortages = []
+    for material in materials:
+        component_id = int(material["component_id"])
+        stock = db.query(Stock).filter(Stock.component_id == component_id).first()
+        actual_qty = float(stock.actual_qty or 0) if stock else 0
+        total_reserved = float(stock.reserved_qty or 0) if stock else 0
+        available_for_order = max(actual_qty - total_reserved + own_reservations.get(component_id, 0), 0)
+        shortage_qty = float(material["qty"]) - available_for_order
+        if shortage_qty > 0:
+            shortages.append({
+                **_component_label(components.get(component_id), component_id),
+                "required_qty": float(material["qty"]),
+                "available_qty": available_for_order,
+                "shortage_qty": shortage_qty,
+            })
+    return shortages
+
+
+def _order_target_qty(db: Session, order_id: int) -> float:
+    return sum(
+        float(item.quantity or 0)
+        for item in db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
+    )
+
+
+def _assembly_materials_complete(db: Session, order_id: int, exclude_receipt_id: int | None = None) -> bool:
+    if _remaining_order_materials(db, order_id):
+        return False
+    query = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "assembler_receive_materials",
+        WorkflowTask.status.in_(["assigned", "in_progress", "open"]),
+    )
+    if exclude_receipt_id:
+        query = query.filter(WorkflowTask.id != exclude_receipt_id)
+    return query.first() is None
+
+
+def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool) -> WorkflowTask:
+    target_qty = _order_target_qty(db, order.id)
+    task = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order.id,
+        WorkflowTask.type == "assembler_build",
+        WorkflowTask.status != "done",
+    ).first()
+    if task:
+        task.payload = {
+            **(task.payload or {}),
+            "planned_qty": target_qty,
+            "materials_complete": materials_complete,
+        }
+        if materials_complete:
+            task.title = f"Собрать изделия по заказу #{order.id}"
+            task.description = "Полный комплект получен. Завершить сборку всего количества изделий по заказу."
+        return task
+
+    return create_task(
+        db,
+        order_id=order.id,
+        task_type="assembler_build",
+        title=f"Начать подготовительные работы по заказу #{order.id}" if not materials_complete else f"Собрать изделия по заказу #{order.id}",
+        role="assembler",
+        description=(
+            "Получена часть комплекта. Указать количество изделий, по которым можно начать подготовительные работы."
+            if not materials_complete
+            else "Отметить количество собранных изделий."
+        ),
+        payload={"planned_qty": target_qty, "materials_complete": materials_complete, "started_qty": 0},
+    )
+
+
 def _ensure_order_reserved(db: Session, order_id: int):
     existing = db.query(Reservation).filter(Reservation.order_id == order_id).first()
     if existing:
         return
 
-    materials = _calculate_order_materials(db, order_id)
+    materials = _remaining_order_materials(db, order_id)
+    if not materials:
+        return
     shortages = find_shortages(db, materials)
     if shortages:
         raise HTTPException(status_code=400, detail={"message": "Комплектующие все еще в дефиците", "shortages": shortages})
@@ -253,7 +395,8 @@ def _ensure_order_reserved(db: Session, order_id: int):
         db.add(Reservation(order_id=order_id, component_id=material["component_id"], qty=material["qty"]))
 
 
-def _issue_reserved_materials(db: Session, order_id: int):
+def _issue_reserved_materials(db: Session, order_id: int, task: WorkflowTask | None = None,
+                              actor_user_id: int | None = None):
     reservations = db.query(Reservation).filter(Reservation.order_id == order_id).all()
     if not reservations:
         raise HTTPException(status_code=400, detail="По заказу нет резерва материалов")
@@ -268,16 +411,51 @@ def _issue_reserved_materials(db: Session, order_id: int):
             raise HTTPException(status_code=400, detail=f"Недостаточно резерва компонента ID {item.component_id}")
         stock.actual_qty -= item.qty
         stock.reserved_qty -= item.qty
+        record_movement(
+            db,
+            direction="outgoing",
+            quantity=item.qty,
+            balance_after=stock.actual_qty,
+            component_id=item.component_id,
+            location=stock.location,
+            task_id=task.id if task else None,
+            order_id=order_id,
+            actor_user_id=actor_user_id,
+            counterparty_role="assembler",
+            note="Выдача комплектующих в сборку",
+        )
+        db.delete(item)
 
 
-def _receive_finished_goods(db: Session, order_id: int):
+def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | None = None,
+                            actor_user_id: int | None = None):
     order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
     for item in order_items:
         stock = db.query(Stock).filter(Stock.product_id == item.product_id).first()
         if stock:
             stock.actual_qty = (stock.actual_qty or 0) + item.quantity
         else:
-            db.add(Stock(product_id=item.product_id, actual_qty=item.quantity, location="Finished Goods"))
+            stock = Stock(product_id=item.product_id, actual_qty=item.quantity, location="Finished Goods")
+            db.add(stock)
+        packer_task = db.query(WorkflowTask).filter(
+            WorkflowTask.order_id == order_id,
+            WorkflowTask.type == "packer_pack",
+            WorkflowTask.status == "done",
+        ).order_by(WorkflowTask.id.desc()).first()
+        record_movement(
+            db,
+            direction="incoming",
+            quantity=item.quantity,
+            balance_after=stock.actual_qty,
+            product_id=item.product_id,
+            location=stock.location,
+            task_id=task.id if task else None,
+            order_id=order_id,
+            actor_user_id=actor_user_id,
+            counterparty_user_id=packer_task.assigned_user_id if packer_task else None,
+            counterparty_role="packer",
+            note="Оприходование готовой продукции",
+        )
 
 
 def _complete_procurement_task(db: Session, task: WorkflowTask, completion_payload: dict, order: Order | None):
@@ -333,11 +511,12 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
             order.status = "Procurement Required"
         return {"status": "partial", "remaining": remaining}
 
-    task.status = "waiting_delivery"
+    task.status = "done"
+    task.completed_at = datetime.utcnow()
     task.payload = {**task.payload, "completion": completion_payload}
     if order:
         order.status = "Awaiting Components"
-    return {"status": "waiting_delivery"}
+    return {"status": "done"}
 
 
 def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: dict):
@@ -411,14 +590,16 @@ def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: 
             order.status = "Procurement Required"
         return {"status": "partial", "remaining": remaining, "purchase": purchase}
 
-    task.status = "waiting_delivery"
+    task.status = "done"
+    task.completed_at = datetime.utcnow()
     order = db.query(Order).filter(Order.id == task.order_id).first() if task.order_id else None
     if order:
         order.status = "Awaiting Components"
-    return {"status": "waiting_delivery", "purchase": purchase}
+    return {"status": "done", "purchase": purchase}
 
 
-def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion_payload: dict, order: Order | None):
+def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion_payload: dict, order: Order | None,
+                                     actor_user_id: int | None = None):
     payload = task.payload or {}
     incoming = payload.get("shortages", [])
     received, remaining = _split_component_lines(incoming, _line_qty_map(completion_payload.get("items", [])))
@@ -426,10 +607,23 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
     if not received:
         raise HTTPException(status_code=400, detail="Укажите хотя бы одну принятую позицию")
 
-    _receive_components_to_stock(db, received)
+    _receive_components_to_stock(db, received, task, actor_user_id)
     _update_procurement_purchase_receipt(db, payload, received)
+    ordered_items = payload.get("ordered_items") or [dict(line) for line in incoming]
+    receipt_history = [*(payload.get("receipt_history") or []), {
+        "received_at": datetime.utcnow().isoformat(),
+        "items": [
+            {
+                "component_id": int(line["component_id"]),
+                "qty": float(line.get("qty") or line.get("shortage_qty") or 0),
+            }
+            for line in received
+        ],
+    }]
     task.payload = {
         **payload,
+        "ordered_items": ordered_items,
+        "receipt_history": receipt_history,
         "shortages": remaining,
         "last_completion": completion_payload,
     }
@@ -443,7 +637,7 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
     task.completed_at = datetime.utcnow()
     task.payload = {**task.payload, "completion": completion_payload}
 
-    materials = _calculate_order_materials(db, task.order_id)
+    materials = _remaining_order_materials(db, task.order_id)
     shortages = find_shortages(db, materials)
     if shortages:
         if order:
@@ -463,15 +657,16 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
     _ensure_order_reserved(db, task.order_id)
     if order:
         order.status = "Components Available"
-    create_task(
-        db,
-        order_id=task.order_id,
-        task_type="warehouse_issue_materials",
-        title=f"Выдать комплектующие по заказу #{task.order_id}",
-        role="warehouse",
-        description="Передать комплектующие сборщику.",
-        payload={"materials": enrich_component_lines(db, materials)},
-    )
+    if materials and not _open_task_exists(db, task.order_id, "warehouse_issue_materials"):
+        create_task(
+            db,
+            order_id=task.order_id,
+            task_type="warehouse_issue_materials",
+            title=f"Выдать поступившие комплектующие по заказу #{task.order_id}",
+            role="warehouse",
+            description="Передать сборщику оставшуюся партию комплектующих.",
+            payload={"materials": enrich_component_lines(db, materials)},
+        )
     return {"status": "done"}
 
 
@@ -496,6 +691,25 @@ def _complete_accounting_payment_task(db: Session, task: WorkflowTask, completio
 
 
 def create_initial_order_tasks(db: Session, order: Order, materials: list[dict], shortages: list[dict]):
+    available_materials = _available_materials(materials, shortages)
+    if available_materials:
+        reserve_components(db, available_materials)
+        for material in available_materials:
+            db.add(Reservation(
+                order_id=order.id,
+                component_id=material["component_id"],
+                qty=material["qty"],
+            ))
+        create_task(
+            db,
+            order_id=order.id,
+            task_type="warehouse_issue_materials",
+            title=f"Выдать имеющиеся комплектующие по заказу #{order.id}",
+            role="warehouse",
+            description="Передать сборщику доступную часть комплекта; недостающие позиции закупаются параллельно.",
+            payload={"materials": enrich_component_lines(db, available_materials), "partial": bool(shortages)},
+        )
+
     if shortages:
         order.status = "Procurement Required"
         create_task(
@@ -507,21 +721,59 @@ def create_initial_order_tasks(db: Session, order: Order, materials: list[dict],
             description="Загрузить счет, указать ожидаемую дату поступления и закрыть задачу после оформления закупки.",
             payload={"shortages": shortages},
         )
-        return
+    else:
+        order.status = "Reserved"
 
-    order.status = "Reserved"
+
+def _complete_assembler_build_task(
+    db: Session,
+    task: WorkflowTask,
+    completion_payload: dict,
+    order: Order | None,
+):
+    assembled_qty = float(completion_payload.get("assembled_qty") or 0)
+    if assembled_qty <= 0:
+        raise HTTPException(status_code=400, detail="Укажите количество изделий в работе")
+
+    target_qty = _order_target_qty(db, task.order_id)
+    materials_complete = _assembly_materials_complete(db, task.order_id)
+    task.payload = {
+        **(task.payload or {}),
+        "planned_qty": target_qty,
+        "materials_complete": materials_complete,
+        "started_qty": assembled_qty,
+        "completion": completion_payload,
+    }
+    if order:
+        order.status = "In Assembly"
+
+    if not materials_complete:
+        task.status = "in_progress"
+        return {
+            "status": "partial",
+            "started_qty": assembled_qty,
+            "planned_qty": target_qty,
+            "message": "Подготовительные работы сохранены; ожидается полный комплект материалов",
+        }
+
+    task.status = "done"
+    task.completed_at = datetime.utcnow()
+    if order:
+        order.status = "Quality Check"
     create_task(
         db,
-        order_id=order.id,
-        task_type="warehouse_issue_materials",
-        title=f"Выдать комплектующие по заказу #{order.id}",
-        role="warehouse",
-        description="Передать зарезервированные комплектующие сборщику.",
-        payload={"materials": enrich_component_lines(db, materials)},
+        order_id=task.order_id,
+        task_type="tester_check",
+        title=f"Протестировать изделия по заказу #{task.order_id}",
+        role="tester",
+        description="Отметить годные и бракованные изделия.",
+        payload={"assembled_qty": assembled_qty, "planned_qty": target_qty},
     )
+    return {"status": "done"}
 
 
-def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | None = None):
+def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | None = None,
+                  actor_user_id: int | None = None):
     if task.status == "done":
         raise HTTPException(status_code=400, detail="Задача уже закрыта")
 
@@ -533,7 +785,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         return _complete_procurement_task(db, task, completion_payload, order)
 
     elif task.type == "warehouse_receive_components":
-        return _complete_warehouse_receive_task(db, task, completion_payload, order)
+        return _complete_warehouse_receive_task(db, task, completion_payload, order, actor_user_id)
 
     elif task.type == "accounting_payment":
         task.payload = {**payload, "completion": completion_payload}
@@ -541,47 +793,71 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         task.completed_at = datetime.utcnow()
         return _complete_accounting_payment_task(db, task, completion_payload, order)
 
+    elif task.type == "assembler_build":
+        return _complete_assembler_build_task(db, task, completion_payload, order)
+
     task.payload = {**payload, "completion": completion_payload}
     task.status = "done"
     task.completed_at = datetime.utcnow()
 
     if task.type == "warehouse_issue_materials":
-        _issue_reserved_materials(db, task.order_id)
+        _issue_reserved_materials(db, task.order_id, task, actor_user_id)
+        # SessionLocal работает с autoflush=False: фиксируем статус текущей выдачи,
+        # чтобы расчет остатка учел ее как уже выданную партию.
+        db.flush()
+        remaining_materials = _remaining_order_materials(db, task.order_id)
         if order:
-            order.status = "Materials Issued"
+            order.status = "Procurement Required" if remaining_materials else "Materials Issued"
         create_task(
             db,
             order_id=task.order_id,
             task_type="assembler_receive_materials",
-            title=f"Получить комплектующие по заказу #{task.order_id}",
+            title=f"Получить {'часть ' if remaining_materials else ''}комплектующих по заказу #{task.order_id}",
             role="assembler",
-            description="Подтвердить получение комплекта в сборку.",
+            description="Подтвердить получение выданной складом партии комплектующих.",
+            payload={"materials": payload.get("materials", []), "partial": bool(remaining_materials)},
         )
 
     elif task.type == "assembler_receive_materials":
+        for movement in db.query(InventoryMovement).filter(
+            InventoryMovement.order_id == task.order_id,
+            InventoryMovement.direction == "outgoing",
+            InventoryMovement.counterparty_role == "assembler",
+            InventoryMovement.counterparty_user_id.is_(None),
+        ).all():
+            movement.counterparty_user_id = actor_user_id
+        remaining_materials = _remaining_order_materials(db, task.order_id)
+        if remaining_materials and not _open_task_exists(db, task.order_id, "warehouse_issue_materials"):
+            available_remaining = _available_materials(
+                remaining_materials,
+                find_shortages(db, remaining_materials),
+            )
+            if available_remaining:
+                reserve_components(db, available_remaining)
+                for material in available_remaining:
+                    db.add(Reservation(
+                        order_id=task.order_id,
+                        component_id=material["component_id"],
+                        qty=material["qty"],
+                    ))
+                create_task(
+                    db,
+                    order_id=task.order_id,
+                    task_type="warehouse_issue_materials",
+                    title=f"Выдать следующую партию комплектующих по заказу #{task.order_id}",
+                    role="warehouse",
+                    description="Передать сборщику поступившую часть комплекта.",
+                    payload={"materials": enrich_component_lines(db, available_remaining), "partial": True},
+                )
+        materials_complete = _assembly_materials_complete(db, task.order_id, exclude_receipt_id=task.id)
+        if not materials_complete:
+            if order:
+                order.status = "Procurement Required" if remaining_materials else "Materials Issued"
+        else:
+            if order:
+                order.status = "In Assembly"
         if order:
-            order.status = "In Assembly"
-        create_task(
-            db,
-            order_id=task.order_id,
-            task_type="assembler_build",
-            title=f"Собрать изделия по заказу #{task.order_id}",
-            role="assembler",
-            description="Отметить количество собранных изделий.",
-        )
-
-    elif task.type == "assembler_build":
-        if order:
-            order.status = "Quality Check"
-        create_task(
-            db,
-            order_id=task.order_id,
-            task_type="tester_check",
-            title=f"Протестировать изделия по заказу #{task.order_id}",
-            role="tester",
-            description="Отметить годные и бракованные изделия.",
-            payload={"assembled_qty": completion_payload.get("assembled_qty")},
-        )
+            _ensure_assembly_task(db, order, materials_complete)
 
     elif task.type == "tester_check":
         defective_qty = int(completion_payload.get("defective_qty") or 0)
@@ -635,7 +911,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         )
 
     elif task.type == "warehouse_finished_goods":
-        _receive_finished_goods(db, task.order_id)
+        _receive_finished_goods(db, task.order_id, task, actor_user_id)
         if order:
             order.status = "Ready To Ship"
 

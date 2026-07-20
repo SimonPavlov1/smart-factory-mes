@@ -1,6 +1,11 @@
 from datetime import datetime
+from io import BytesIO
+from urllib.parse import quote
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -11,7 +16,8 @@ from app.models.inventory import Stock, Component  # Component использу�
 from app.services.reservation_service import reserve_components
 from app.services.production_planning import get_bom_requirements
 from app.services.auth_service import require_roles, user_roles
-from app.services.workflow_service import create_initial_order_tasks, find_shortages
+from app.services.workflow_service import complete_task, create_initial_order_tasks, find_order_shortages, find_shortages
+from app.services.xlsx_service import build_table_xlsx
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
 from app.schemas.order import OrderCreate, OrderOut
@@ -276,6 +282,58 @@ def _structured_bom_summary_for_order(order_items, db: Session):
     )
 
 
+def _excel_column(index: int) -> str:
+    result = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _bom_xlsx(rows: list[dict]) -> BytesIO:
+    headers = ["Изделие", "Сборочная единица", "Категория", "Поз. обозначение", "Наименование", "Артикул", "Количество"]
+    data = [headers] + [[
+        row.get("device") or "—",
+        row.get("assembly") or "—",
+        row.get("category") or "—",
+        row.get("designators") or "—",
+        row.get("name") or "—",
+        row.get("sku") or "—",
+        row.get("qty") or 0,
+    ] for row in rows]
+
+    xml_rows = []
+    for row_index, values in enumerate(data, start=1):
+        cells = []
+        for column_index, value in enumerate(values, start=1):
+            reference = f"{_excel_column(column_index)}{row_index}"
+            style = ' s="1"' if row_index == 1 else ""
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                cells.append(f'<c r="{reference}"{style}><v>{value}</v></c>')
+            else:
+                cells.append(f'<c r="{reference}" t="inlineStr"{style}><is><t>{escape(str(value))}</t></is></c>')
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    worksheet = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+  <cols><col min="1" max="1" width="28" customWidth="1"/><col min="2" max="2" width="32" customWidth="1"/><col min="3" max="3" width="24" customWidth="1"/><col min="4" max="4" width="20" customWidth="1"/><col min="5" max="5" width="48" customWidth="1"/><col min="6" max="6" width="24" customWidth="1"/><col min="7" max="7" width="14" customWidth="1"/></cols>
+  <sheetData>{''.join(xml_rows)}</sheetData>
+  <autoFilter ref="A1:G{len(data)}"/>
+</worksheet>'''
+
+    output = BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>''')
+        archive.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>''')
+        archive.writestr("xl/workbook.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Комплектация" sheetId="1" r:id="rId1"/></sheets></workbook>''')
+        archive.writestr("xl/_rels/workbook.xml.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>''')
+        archive.writestr("xl/styles.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF3F8CFF"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs></styleSheet>''')
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    output.seek(0)
+    return output
+
+
 def _parse_optional_date(value: str | None):
     if not value:
         return None
@@ -380,6 +438,7 @@ def _order_payload(order: Order, db: Session):
         ],
         "tasks": [_task_payload(task, users_by_id) for task in tasks],
         "stages": stages,
+        "shortages": find_order_shortages(db, order.id),
     }
 
 
@@ -439,16 +498,6 @@ def create_production_order(
         total_needed_items = _calculate_materials_for_items(order_items, db)
         materials_list = _materials_list(total_needed_items)
         shortages = find_shortages(db, materials_list)
-
-        if not shortages:
-            reserve_components(db, materials_list)
-
-            for material in materials_list:
-                db.add(Reservation(
-                    order_id=new_order.id,
-                    component_id=material["component_id"],
-                    qty=material["qty"]
-                ))
 
         create_initial_order_tasks(db, new_order, materials_list, shortages)
 
@@ -522,50 +571,28 @@ def issue_materials_for_order(
     if order.status not in ["In Progress", "Reserved"]:
         raise HTTPException(status_code=400, detail="Материалы уже выданы или заказ завершен")
 
-    reservations = db.query(Reservation).filter(Reservation.order_id == order_id).all()
-    if not reservations:
-        if order.status != "In Progress":
-            raise HTTPException(status_code=400, detail="По заказу нет сохраненного резерва материалов")
+    issue_task = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "warehouse_issue_materials",
+        WorkflowTask.status.in_(["assigned", "in_progress", "open"]),
+    ).order_by(WorkflowTask.id).first()
+    if issue_task:
+        try:
+            result = complete_task(db, issue_task, {}, actor_user_id=_.id)
+            db.commit()
+            return {
+                "status": "success",
+                "message": "Материалы выданы, задача получения создана",
+                "result": result,
+            }
+        except HTTPException:
+            db.rollback()
+            raise
 
-        order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
-        total_needed_items = _calculate_materials_for_items(order_items, db)
-        reservations = [
-            Reservation(order_id=order.id, component_id=material["component_id"], qty=material["qty"])
-            for material in _materials_list(total_needed_items)
-        ]
-        for reservation in reservations:
-            db.add(reservation)
-
-    try:
-        for item in reservations:
-            stock = db.query(Stock).filter(Stock.component_id == item.component_id).with_for_update().first()
-            if not stock:
-                raise HTTPException(status_code=404, detail=f"Компонент {item.component_id} отсутствует на складе")
-
-            stock.actual_qty = stock.actual_qty or 0
-            stock.reserved_qty = stock.reserved_qty or 0
-
-            if stock.actual_qty < item.qty:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Недостаточно товара на складе для компонента ID {item.component_id}"
-                )
-            if stock.reserved_qty < item.qty:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Недостаточно зарезервировано для компонента ID {item.component_id}"
-                )
-
-            stock.actual_qty -= item.qty
-            stock.reserved_qty -= item.qty
-
-        order.status = "Materials Issued"
-        db.commit()
-    except HTTPException:
-        db.rollback()
-        raise
-
-    return {"status": "success", "message": "Материалы по всем позициям выданы в цех"}
+    raise HTTPException(
+        status_code=400,
+        detail="По заказу нет активной задачи выдачи. Обновите производственный маршрут.",
+    )
 
 
 # =====================================================================
@@ -587,3 +614,58 @@ def get_order_bom_summary(
 
     order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
     return _structured_bom_summary_for_order(order_items, db)
+
+
+@router.get("/orders/{order_id}/bom-summary.xlsx", summary="Скачать сводную комплектацию в Excel")
+def download_order_bom_summary(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
+    rows = _structured_bom_summary_for_order(order_items, db)
+    filename = f"Сводная комплектация заказа {order_id}.xlsx"
+    return StreamingResponse(
+        _bom_xlsx(rows),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@router.get("/orders/{order_id}/shortages.xlsx", summary="Скачать ведомость недостающих деталей")
+def download_order_shortages(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    shortages = find_order_shortages(db, order_id)
+    rows = [[
+        index,
+        line.get("component_name") or f"Компонент ID {line['component_id']}",
+        line.get("part_number") or "—",
+        line.get("category") or "—",
+        float(line.get("required_qty") or 0),
+        float(line.get("available_qty") or 0),
+        float(line.get("shortage_qty") or 0),
+        "",
+    ] for index, line in enumerate(shortages, start=1)]
+    workbook = build_table_xlsx(
+        sheet_name="Дефицит",
+        title="Ведомость недостающих деталей",
+        metadata=[("Заказ", f"№ {order_id}"), ("Заказчик", order.customer_name or "—"), ("Позиций в дефиците", str(len(shortages)))],
+        headers=["№", "Наименование", "Артикул", "Категория", "Требуется", "Доступно", "Не хватает", "Примечание"],
+        rows=rows,
+        widths=[7, 46, 28, 24, 14, 14, 14, 30],
+    )
+    filename = f"Ведомость недостающих деталей заказ {order_id}.xlsx"
+    return StreamingResponse(
+        workbook,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, Text, JSON
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, Text, JSON, DateTime, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -53,3 +53,24 @@ class Stock(Base):
 
     component = relationship("Component", back_populates="stock")
     reserved_qty = Column(Float, default=0.0)
+
+
+class InventoryMovement(Base):
+    """Immutable audit trail for component and finished-goods stock movements."""
+    __tablename__ = "inventory_movements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    component_id = Column(Integer, ForeignKey("components.id"), nullable=True, index=True)
+    product_id = Column(Integer, ForeignKey("product_types.id"), nullable=True, index=True)
+    direction = Column(String, nullable=False, index=True)  # incoming / outgoing
+    quantity = Column(Float, nullable=False)
+    balance_after = Column(Float, nullable=False)
+    location = Column(String, nullable=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=True, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    counterparty_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    counterparty_role = Column(String, nullable=True)
+    recipient = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False, index=True)

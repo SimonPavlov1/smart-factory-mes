@@ -6,7 +6,7 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.database import Base
-from app.models.inventory import Component, Stock
+from app.models.inventory import Component, Stock, InventoryMovement
 from app.models.procurement import PurchaseOrder, PurchaseItem
 from app.models.production import ProductType, ProductBOM, Reservation, Item
 
