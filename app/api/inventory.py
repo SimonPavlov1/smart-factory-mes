@@ -96,6 +96,38 @@ def get_components(
     return [_component_payload(comp, stock_map.get(comp.id, 0.0)) for comp in components]
 
 
+@router.get("/components/page")
+def get_components_page(
+    search: Optional[str] = Query(None),
+    categories: Optional[List[str]] = Query(None),
+    after_id: Optional[int] = Query(None, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _=Depends(require_roles(*INVENTORY_READ_ROLES)),
+):
+    """Cursor-paginated inventory feed for large warehouses."""
+    query = _apply_component_search(db.query(Component), search)
+    if categories:
+        query = query.filter(Component.category.in_(categories))
+    if after_id is not None:
+        query = query.filter(Component.id > after_id)
+
+    components = query.order_by(Component.id).limit(limit + 1).all()
+    has_more = len(components) > limit
+    page = components[:limit]
+    component_ids = [component.id for component in page]
+    stock_map = {
+        stock.component_id: stock.actual_qty
+        for stock in db.query(Stock).filter(Stock.component_id.in_(component_ids)).all()
+    } if component_ids else {}
+
+    return {
+        "items": [_component_payload(component, stock_map.get(component.id, 0.0)) for component in page],
+        "next_cursor": page[-1].id if has_more and page else None,
+        "has_more": has_more,
+    }
+
+
 @router.get("/components/search")
 def search_components(
     q: str = Query("", description="Поиск по названию, артикулу, категории, корпусу или номиналу"),
