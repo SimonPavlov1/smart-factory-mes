@@ -14,3 +14,7 @@ storage/
 
 #docs
 docs/GIT_GUIDE.md
+/sql_app.db.before_inventory_import_20260720_1533.bak
+/scripts/import_inventory_xlsx.py
+/sql_app.db.before_part_number_names_20260720.bak
+/sql_app.db.before_specifications_cleanup_20260720.bak
