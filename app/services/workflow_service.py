@@ -706,7 +706,7 @@ def _product_context_from_line(line: dict) -> dict | None:
         "product_id": line.get("product_id"),
         "product_name": line.get("product_name"),
         "drawing_number": line.get("drawing_number"),
-        "qty": line.get("qty") or line.get("product_qty"),
+        "qty": line.get("product_qty") or line.get("qty"),
     }
 
 
@@ -954,6 +954,22 @@ def _product_context_matches(expected: dict, actual: dict) -> bool:
     return False
 
 
+def _normalize_product_context_qty(db: Session, order_id: int, product_context: dict | None) -> dict | None:
+    if not product_context:
+        return product_context
+    result = dict(product_context)
+    order_item_id = result.get("order_item_id")
+    if order_item_id:
+        order_item = db.query(OrderItem).filter(
+            OrderItem.id == int(order_item_id),
+            OrderItem.order_id == order_id,
+        ).first()
+        if order_item:
+            result["qty"] = float(order_item.quantity or 0)
+            return result
+    return result
+
+
 def _accepted_complete_kit_qty_for_product(db: Session, order_id: int, product_context: dict) -> float:
     """Count complete kits accepted by assembly before possible BOM changes."""
     target_qty = float(product_context.get("qty") or 0)
@@ -1104,8 +1120,8 @@ def _buildable_qty_from_issued(db: Session, order_id: int, product_context: dict
             "missing_qty_for_one": max(required - issued_qty, 0),
         })
     live_qty = min(possible_qty) if possible_qty else float(product_context.get("qty") or 0)
-    qty = max(live_qty, snapshot_qty)
-    snapshot_used = snapshot_qty > live_qty
+    qty = live_qty
+    snapshot_used = False
     return {
         "qty": qty,
         "lines": lines,
@@ -1187,6 +1203,7 @@ def _assembly_materials_complete(db: Session, order_id: int, exclude_receipt_id:
 
 def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
                           product_context: dict | None = None) -> WorkflowTask:
+    product_context = _normalize_product_context_qty(db, order.id, product_context)
     target_qty = float(product_context.get("qty") or 0) if product_context else _order_target_qty(db, order.id)
     product_name = product_context.get("product_name") if product_context else None
     context_label = f" · {product_name}" if product_name else ""
@@ -1239,6 +1256,11 @@ def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
         task = next((candidate for candidate in tasks if not (candidate.payload or {}).get("product_context")), None)
     if task:
         existing_payload = task.payload or {}
+        existing_context = existing_payload.get("product_context") or {}
+        if product_context and existing_context:
+            product_context = {**product_context, "qty": max(float(existing_context.get("qty") or 0), target_qty)}
+            target_qty = float(product_context.get("qty") or target_qty)
+            product_lines = [{**line, "qty": target_qty} for line in product_lines]
         task.payload = {
             **existing_payload,
             **({"product_context": product_context} if product_context else {}),
@@ -1493,10 +1515,12 @@ def ensure_missing_order_item_workflows(db: Session):
                 "drawing_number": product.drawing_number,
                 "qty": item.quantity,
             }
+            material_context = {**product_context, "product_qty": item.quantity}
+            material_context.pop("qty", None)
             if key in existing_keys:
                 continue
             materials = [
-                {**material, **product_context}
+                {**material, **material_context}
                 for material in get_bom_requirements(item.product_id, item.quantity, db)
             ]
             shortages = find_shortages(db, materials)
@@ -1822,21 +1846,45 @@ def _issue_reserved_materials(db: Session, order_id: int, task: WorkflowTask | N
 
 def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | None = None,
                             actor_user_id: int | None = None):
-    accepted = {
-        int(line["product_id"]): float(line.get("qty") or 0)
-        for line in ((task.payload or {}).get("completion") or {}).get("accepted_goods", [])
+    if not task:
+        raise HTTPException(status_code=400, detail="Оприходование возможно только из задачи приемки готовой продукции")
+
+    payload = task.payload or {}
+    completion = payload.get("completion") or {}
+    finished_goods = payload.get("finished_goods") or []
+    accepted_lines = [
+        line
+        for line in completion.get("accepted_goods", [])
         if line.get("product_id") and float(line.get("qty") or 0) > 0
-    } if task else {}
-    order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
-    for item in order_items:
-        qty = accepted.get(item.product_id, item.quantity)
+    ]
+    if not accepted_lines:
+        raise HTTPException(status_code=400, detail="Укажите, сколько готовой продукции принять на склад")
+
+    accepted = {}
+    for line in accepted_lines:
+        product_id = int(line["product_id"])
+        accepted[product_id] = accepted.get(product_id, 0) + float(line.get("qty") or 0)
+
+    max_by_product = {}
+    for line in finished_goods:
+        if line.get("product_id"):
+            product_id = int(line["product_id"])
+            max_by_product[product_id] = max_by_product.get(product_id, 0) + float(line.get("qty") or 0)
+
+    for product_id, qty in accepted.items():
+        max_qty = max_by_product.get(product_id)
+        if max_qty is not None and qty > max_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Нельзя принять {qty:g} шт.: в задаче к оприходованию доступно {max_qty:g} шт.",
+            )
         if qty <= 0:
             continue
-        stock = db.query(Stock).filter(Stock.product_id == item.product_id).first()
+        stock = db.query(Stock).filter(Stock.product_id == product_id).first()
         if stock:
             stock.actual_qty = (stock.actual_qty or 0) + qty
         else:
-            stock = Stock(product_id=item.product_id, actual_qty=qty, location="Finished Goods")
+            stock = Stock(product_id=product_id, actual_qty=qty, location="Finished Goods")
             db.add(stock)
         packer_task = db.query(WorkflowTask).filter(
             WorkflowTask.order_id == order_id,
@@ -1848,7 +1896,7 @@ def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | Non
             direction="incoming",
             quantity=qty,
             balance_after=stock.actual_qty,
-            product_id=item.product_id,
+            product_id=product_id,
             location=stock.location,
             task_id=task.id if task else None,
             order_id=order_id,
@@ -1857,6 +1905,39 @@ def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | Non
             counterparty_role="packer",
             note="Оприходование готовой продукции",
         )
+
+
+def _order_finished_qty_by_product(db: Session, order_id: int) -> dict[int, float]:
+    result = {}
+    movements = db.query(InventoryMovement).filter(
+        InventoryMovement.order_id == order_id,
+        InventoryMovement.direction == "incoming",
+        InventoryMovement.product_id.isnot(None),
+    ).all()
+    for movement in movements:
+        product_id = int(movement.product_id)
+        result[product_id] = result.get(product_id, 0) + float(movement.quantity or 0)
+    return result
+
+
+def _order_ready_blockers(db: Session, order_id: int) -> list[str]:
+    blockers = []
+    active_tasks = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.status.notin_(["done", "cancelled"]),
+    ).all()
+    if active_tasks:
+        blockers.append("есть незавершенные задачи: " + ", ".join(f"#{task.id} {task.title}" for task in active_tasks[:5]))
+
+    finished_qty = _order_finished_qty_by_product(db, order_id)
+    for item in db.query(OrderItem).filter(OrderItem.order_id == order_id).all():
+        actual_qty = finished_qty.get(int(item.product_id), 0)
+        required_qty = float(item.quantity or 0)
+        if actual_qty < required_qty:
+            product = db.query(ProductType).filter(ProductType.id == item.product_id).first()
+            product_name = product.name if product else f"Изделие ID {item.product_id}"
+            blockers.append(f"{product_name}: оприходовано {actual_qty:g} из {required_qty:g} шт.")
+    return blockers
 
 
 def _complete_procurement_task(db: Session, task: WorkflowTask, completion_payload: dict, order: Order | None):
@@ -2642,6 +2723,8 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
 
     elif task.type == "tester_check":
         product_context = payload.get("product_context")
+        product_lines = payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        test_total_qty = sum(float(item.get("qty") or 0) for item in product_lines)
         defective_products = [
             {
                 "product_id": int(item["product_id"]),
@@ -2653,6 +2736,20 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
             if item.get("product_id") and int(item.get("defective_qty") or 0) > 0
         ]
         defective_qty = sum(item["defective_qty"] for item in defective_products) or int(completion_payload.get("defective_qty") or 0)
+        passed_qty = float(completion_payload.get("passed_qty") or 0)
+        if test_total_qty <= 0:
+            raise HTTPException(status_code=400, detail="В задаче тестирования нет изделий для проверки")
+        if passed_qty + defective_qty <= 0:
+            raise HTTPException(status_code=400, detail="Укажите количество годных и/или бракованных изделий")
+        tested_qty = passed_qty + defective_qty
+        if abs(tested_qty - test_total_qty) > 0.000001:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Тестирование должно закрыть ровно {test_total_qty:g} шт.: указано {tested_qty:g} шт.",
+            )
+        checklist = completion_payload.get("test_checklist") or payload.get("test_checklist") or []
+        if checklist and any(not item.get("checked") for item in checklist):
+            raise HTTPException(status_code=400, detail="Нельзя закрыть тестирование: чеклист проверки заполнен не полностью")
         if defective_qty > 0:
             if order:
                 order.status = "Repair Required"
@@ -2686,7 +2783,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                 description="Упаковать годные изделия и передать на склад готовой продукции.",
                 payload={
                     **({"product_context": product_context} if product_context else {}),
-                    "product_lines": payload.get("product_lines") or _order_product_lines(db, task.order_id),
+                    "product_lines": product_lines,
                 },
             )
 
@@ -2732,9 +2829,22 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         )
 
     elif task.type == "packer_pack":
+        product_lines = payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        available_qty = sum(float(item.get("qty") or 0) for item in product_lines)
+        packed_qty = float(completion_payload.get("packed_qty") or 0)
+        if available_qty <= 0:
+            raise HTTPException(status_code=400, detail="В задаче упаковки нет изделий для упаковки")
+        if packed_qty <= 0:
+            raise HTTPException(status_code=400, detail="Укажите количество упакованных изделий")
+        if packed_qty > available_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Нельзя упаковать {packed_qty:g} шт.: доступно {available_qty:g} шт.",
+            )
+        if len(product_lines) == 1:
+            product_lines = [{**product_lines[0], "qty": packed_qty}]
         if order:
             order.status = "Finished Goods"
-        product_lines = payload.get("product_lines") or _order_product_lines(db, task.order_id)
         product_context = payload.get("product_context")
         context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
         create_task(
@@ -2754,6 +2864,10 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
     elif task.type == "warehouse_finished_goods":
         _receive_finished_goods(db, task.order_id, task, actor_user_id)
         if order:
+            blockers = _order_ready_blockers(db, task.order_id)
+            if blockers:
+                order.status = "Finished Goods"
+                raise HTTPException(status_code=400, detail="Заказ нельзя закрыть: " + "; ".join(blockers))
             order.status = "Ready To Ship"
 
     return {"status": "done"}

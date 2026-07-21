@@ -513,8 +513,10 @@ def create_production_order(
                 "qty": order_item.quantity,
             }
             product_contexts[order_item.id] = product_context
+            material_context = {**product_context, "product_qty": order_item.quantity}
+            material_context.pop("qty", None)
             materials_list = [
-                {**material, **product_context}
+                {**material, **material_context}
                 for material in get_bom_requirements(order_item.product_id, order_item.quantity, db)
             ]
             all_materials.extend(materials_list)
