@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # --- Схемы для ОТОБРАЖЕНИЯ (Out) ---
 
@@ -30,6 +30,8 @@ class OrderOut(BaseModel):
     id: int
     customer_name: str
     status: str
+    legacy_status: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None
     created_at: datetime
     planned_delivery_date: Optional[datetime] = None
     items: List[OrderItemOut]  # Список позиций

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, Float, ForeignKey, JSON, func, and_
+from sqlalchemy import Column, Integer, String, Boolean, Text, Float, ForeignKey, JSON, func, and_, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.sqltypes import DateTime
 from app.database import Base
@@ -213,3 +213,152 @@ class WorkflowTask(Base):
     due_date = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+
+
+class MaterialTransfer(Base):
+    """Физическая передача компонентов со склада конкретному подразделению."""
+    __tablename__ = "material_transfers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False, index=True)
+    source_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=True, index=True)
+    issue_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=False, unique=True, index=True)
+    receive_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=True, unique=True, index=True)
+    source_task_type = Column(String, nullable=True, index=True)
+    recipient_role = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="reserved", index=True)
+    issued_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    accepted_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    issued_at = Column(DateTime, nullable=True)
+    accepted_at = Column(DateTime, nullable=True)
+
+    lines = relationship("MaterialTransferLine", back_populates="transfer", cascade="all, delete-orphan")
+
+
+class MaterialTransferLine(Base):
+    """Количества одной складской позиции на каждом этапе передачи."""
+    __tablename__ = "material_transfer_lines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transfer_id = Column(Integer, ForeignKey("material_transfers.id", ondelete="CASCADE"), nullable=False, index=True)
+    component_id = Column(Integer, ForeignKey("components.id"), nullable=False, index=True)
+    line_uid = Column(String, nullable=True, index=True)
+    requested_qty = Column(Float, nullable=False, default=0)
+    reserved_qty = Column(Float, nullable=False, default=0)
+    issued_qty = Column(Float, nullable=False, default=0)
+    accepted_qty = Column(Float, nullable=False, default=0)
+
+    transfer = relationship("MaterialTransfer", back_populates="lines")
+
+
+class TaskQuantity(Base):
+    """Нормализованные количества задачи; JSON используется только как снимок для UI."""
+    __tablename__ = "task_quantities"
+    __table_args__ = (
+        UniqueConstraint("task_id", "entity_type", "entity_id", "line_uid", name="uq_task_quantity_line"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=True, index=True)
+    entity_type = Column(String, nullable=False, index=True)  # component / product
+    entity_id = Column(Integer, nullable=False, index=True)
+    line_uid = Column(String, nullable=False, default="", index=True)
+    requested_qty = Column(Float, nullable=False, default=0)
+    reserved_qty = Column(Float, nullable=False, default=0)
+    purchased_qty = Column(Float, nullable=False, default=0)
+    received_qty = Column(Float, nullable=False, default=0)
+    issued_qty = Column(Float, nullable=False, default=0)
+    accepted_qty = Column(Float, nullable=False, default=0)
+    processed_qty = Column(Float, nullable=False, default=0)
+    rejected_qty = Column(Float, nullable=False, default=0)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MaterialBatch(Base):
+    """Партия закупки/приемки либо выпуска, больше не спрятанная в payload задачи."""
+    __tablename__ = "material_batches"
+    __table_args__ = (
+        UniqueConstraint("source_task_id", "external_key", name="uq_material_batch_source_key"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=False, index=True)
+    batch_type = Column(String, nullable=False, index=True)  # purchase / receipt / test / packing / finished_goods
+    external_key = Column(String, nullable=False, default="default")
+    status = Column(String, nullable=False, default="recorded", index=True)
+    document_ref = Column(String, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    lines = relationship("MaterialBatchLine", back_populates="batch", cascade="all, delete-orphan")
+
+
+class MaterialBatchLine(Base):
+    __tablename__ = "material_batch_lines"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "entity_type", "entity_id", "line_uid", name="uq_material_batch_line"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(Integer, ForeignKey("material_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    entity_type = Column(String, nullable=False, index=True)
+    entity_id = Column(Integer, nullable=False, index=True)
+    line_uid = Column(String, nullable=False, default="")
+    quantity = Column(Float, nullable=False)
+    rejected_qty = Column(Float, nullable=False, default=0)
+
+    batch = relationship("MaterialBatch", back_populates="lines")
+
+
+class WorkflowCommand(Base):
+    """Результат команды для безопасного повтора HTTP-запроса."""
+    __tablename__ = "workflow_commands"
+    __table_args__ = (
+        UniqueConstraint("task_id", "idempotency_key", name="uq_workflow_command_task_key"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    idempotency_key = Column(String, nullable=False)
+    command_type = Column(String, nullable=False, default="complete")
+    request_hash = Column(String, nullable=False)
+    response_payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class WorkflowBatch(Base):
+    """Входящая производственная партия внутри накопительной задачи."""
+    __tablename__ = "workflow_batches"
+    __table_args__ = (
+        UniqueConstraint("container_task_id", "batch_key", name="uq_workflow_batch_container_key"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    container_task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=True, index=True)
+    stage = Column(String, nullable=False, index=True)
+    cycle = Column(String, nullable=False, default="primary", index=True)
+    batch_key = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="queued", index=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    processed_at = Column(DateTime, nullable=True)
+
+    lines = relationship("WorkflowBatchLine", back_populates="batch", cascade="all, delete-orphan")
+
+
+class WorkflowBatchLine(Base):
+    __tablename__ = "workflow_batch_lines"
+
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(Integer, ForeignKey("workflow_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    entity_type = Column(String, nullable=False, index=True)
+    entity_id = Column(Integer, nullable=False, index=True)
+    quantity = Column(Float, nullable=False)
+    processed_qty = Column(Float, nullable=False, default=0)
+    rejected_qty = Column(Float, nullable=False, default=0)
+
+    batch = relationship("WorkflowBatch", back_populates="lines")

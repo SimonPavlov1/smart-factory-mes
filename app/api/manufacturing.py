@@ -18,6 +18,7 @@ from app.services.production_planning import get_bom_requirements
 from app.services.auth_service import require_roles, user_roles
 from app.services.workflow_service import complete_task, create_initial_order_tasks, create_procurement_task_for_order, find_order_shortages, find_shortages, plan_material_availability, reconcile_stock_reservations
 from app.services.xlsx_service import build_table_xlsx
+from app.services.order_progress_service import aggregate_order_progress
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
 from app.schemas.order import OrderCreate, OrderOut
@@ -54,6 +55,12 @@ ORDER_STAGES = [
         "title": "Получение сборщиком",
         "description": "Подтверждение получения комплекта",
         "task_types": ["assembler_receive_materials"],
+    },
+    {
+        "key": "repair_receive",
+        "title": "Получение отделом брака",
+        "description": "Подтверждение получения дополнительных компонентов инженером по ремонту",
+        "task_types": ["repair_receive_materials"],
     },
     {
         "key": "assembly",
@@ -418,10 +425,13 @@ def _order_payload(order: Order, db: Session):
             "tasks": [_task_payload(task, users_by_id) for task in stage_tasks],
         })
 
+    progress = aggregate_order_progress(db, order)
     return {
         "id": order.id,
         "customer_name": order.customer_name,
-        "status": order.status,
+        "status": progress["state"],
+        "legacy_status": order.status,
+        "progress": progress,
         "created_at": order.created_at,
         "planned_delivery_date": order.planned_delivery_date,
         "items": [
@@ -456,7 +466,19 @@ def get_production_orders(
     """
     try:
         orders = db.query(Order).all()
-        return orders
+        return [
+            {
+                "id": order.id,
+                "customer_name": order.customer_name,
+                "status": (progress := aggregate_order_progress(db, order))["state"],
+                "legacy_status": order.status,
+                "progress": progress,
+                "created_at": order.created_at,
+                "planned_delivery_date": order.planned_delivery_date,
+                "items": order.items,
+            }
+            for order in orders
+        ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка БД: {str(e)}")
 

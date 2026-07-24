@@ -6,14 +6,41 @@ from sqlalchemy.orm import Session
 
 from app.models.inventory import Component, InventoryMovement, Stock
 from app.models.auth import User
-from app.models.production import Order, OrderItem, ProductBOM, ProductType, Reservation, WorkflowTask
+from app.models.production import (
+    MaterialTransfer,
+    MaterialTransferLine,
+    Order,
+    OrderItem,
+    ProductBOM,
+    ProductType,
+    Reservation,
+    WorkflowTask,
+)
 from app.services.production_planning import get_bom_requirements
 from app.services.reservation_service import reserve_components
 from app.services.inventory_movement_service import record_movement
+from app.services.quantity_service import record_completion_batch, sync_task_quantities
+from app.services.workflow_routes import validate_task_role, validate_transition
+from app.services.workflow_batch_service import (
+    ACCUMULATIVE_TYPES,
+    batch_summary,
+    consume_workflow_batches,
+    find_accumulative_task,
+    merge_accumulative_payload,
+    pending_product_lines,
+    record_workflow_batch,
+)
 
 
 def create_task(db: Session, *, order_id: int, task_type: str, title: str, role: str,
                 description: str = "", payload: dict | None = None) -> WorkflowTask:
+    validate_task_role(task_type, role)
+    payload = payload or {}
+    accumulator = find_accumulative_task(db, order_id, task_type, payload)
+    if accumulator:
+        merge_accumulative_payload(accumulator, payload)
+        record_workflow_batch(db, accumulator, payload)
+        return accumulator
     task = WorkflowTask(
         order_id=order_id,
         type=task_type,
@@ -21,11 +48,119 @@ def create_task(db: Session, *, order_id: int, task_type: str, title: str, role:
         description=description,
         role=role,
         status="assigned",
-        payload=payload or {},
+        payload=payload,
     )
     db.add(task)
     db.flush()
+    if task_type in ACCUMULATIVE_TYPES:
+        record_workflow_batch(db, task, payload)
     return task
+
+
+def _material_transfer_payload(transfer: MaterialTransfer) -> dict:
+    return {
+        "id": transfer.id,
+        "status": transfer.status,
+        "recipient_role": transfer.recipient_role,
+        "source_task_id": transfer.source_task_id,
+        "source_task_type": transfer.source_task_type,
+        "issue_task_id": transfer.issue_task_id,
+        "receive_task_id": transfer.receive_task_id,
+        "lines": [
+            {
+                "component_id": line.component_id,
+                "line_uid": line.line_uid,
+                "requested_qty": line.requested_qty,
+                "reserved_qty": line.reserved_qty,
+                "issued_qty": line.issued_qty,
+                "accepted_qty": line.accepted_qty,
+            }
+            for line in transfer.lines
+        ],
+    }
+
+
+def _ensure_material_transfer(db: Session, issue_task: WorkflowTask, recipient_role: str) -> MaterialTransfer:
+    transfer = db.query(MaterialTransfer).filter(MaterialTransfer.issue_task_id == issue_task.id).first()
+    if transfer:
+        return transfer
+    payload = issue_task.payload or {}
+    transfer = MaterialTransfer(
+        order_id=issue_task.order_id,
+        source_task_id=payload.get("source_task_id"),
+        issue_task_id=issue_task.id,
+        source_task_type=payload.get("source_task_type"),
+        recipient_role=recipient_role,
+        status="reserved",
+    )
+    db.add(transfer)
+    db.flush()
+    for material in payload.get("materials") or []:
+        qty = float(material.get("qty") or 0)
+        if material.get("component_id") and qty > 0:
+            transfer.lines.append(MaterialTransferLine(
+                component_id=int(material["component_id"]),
+                line_uid=material.get("line_uid"),
+                requested_qty=float(material.get("requested_qty") or qty),
+                reserved_qty=qty,
+                issued_qty=0,
+                accepted_qty=0,
+            ))
+    db.flush()
+    issue_task.payload = {**payload, "material_transfer_id": transfer.id}
+    return transfer
+
+
+def _mark_material_transfer_issued(db: Session, issue_task: WorkflowTask, recipient_role: str,
+                                   actor_user_id: int | None) -> MaterialTransfer:
+    transfer = _ensure_material_transfer(db, issue_task, recipient_role)
+    if transfer.status == "accepted":
+        raise HTTPException(status_code=400, detail="Передача компонентов уже подтверждена получателем")
+    transfer.status = "issued"
+    transfer.issued_by_user_id = actor_user_id
+    transfer.issued_at = transfer.issued_at or datetime.utcnow()
+    for line in transfer.lines:
+        line.issued_qty = line.reserved_qty
+    db.flush()
+    return transfer
+
+
+def _attach_material_transfer_receipt(db: Session, transfer: MaterialTransfer, receive_task: WorkflowTask):
+    transfer.receive_task_id = receive_task.id
+    receive_task.payload = {
+        **(receive_task.payload or {}),
+        "material_transfer_id": transfer.id,
+        "material_transfer": _material_transfer_payload(transfer),
+    }
+    issue_task = db.query(WorkflowTask).filter(WorkflowTask.id == transfer.issue_task_id).first()
+    if issue_task:
+        issue_task.payload = {
+            **(issue_task.payload or {}),
+            "material_transfer": _material_transfer_payload(transfer),
+        }
+
+
+def _accept_material_transfer(db: Session, receive_task: WorkflowTask, actor_user_id: int | None):
+    transfer_id = (receive_task.payload or {}).get("material_transfer_id")
+    transfer = (
+        db.query(MaterialTransfer).filter(MaterialTransfer.id == int(transfer_id)).first()
+        if transfer_id else
+        db.query(MaterialTransfer).filter(MaterialTransfer.receive_task_id == receive_task.id).first()
+    )
+    if not transfer:
+        return None
+    if transfer.status != "issued":
+        raise HTTPException(status_code=400, detail="Складская выдача еще не проведена или передача уже подтверждена")
+    transfer.status = "accepted"
+    transfer.accepted_by_user_id = actor_user_id
+    transfer.accepted_at = datetime.utcnow()
+    for line in transfer.lines:
+        line.accepted_qty = line.issued_qty
+    receive_task.payload = {
+        **(receive_task.payload or {}),
+        "material_transfer": _material_transfer_payload(transfer),
+    }
+    return transfer
 
 
 def _component_label(component: Component | None, component_id: int) -> dict:
@@ -56,6 +191,41 @@ def enrich_component_lines(db: Session, lines: list[dict]) -> list[dict]:
         {**_component_label(components.get(line["component_id"]), line["component_id"]), **line}
         for line in lines
     ]
+
+
+def _active_stage_exists(db: Session, order_id: int, task_types: list[str], exclude_task_id: int | None = None) -> bool:
+    query = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type.in_(task_types),
+        WorkflowTask.status.in_(["assigned", "open", "in_progress", "hold", "ready_to_issue"]),
+    )
+    if exclude_task_id:
+        query = query.filter(WorkflowTask.id != exclude_task_id)
+    return bool(query.first())
+
+
+def _active_primary_testing_exists(db: Session, order_id: int, exclude_task_id: int | None = None) -> bool:
+    query = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "tester_check",
+        WorkflowTask.status.in_(["assigned", "open", "in_progress", "hold"]),
+    )
+    if exclude_task_id:
+        query = query.filter(WorkflowTask.id != exclude_task_id)
+    return any(not bool((task.payload or {}).get("retest")) for task in query.all())
+
+
+def _take_product_quantity(lines: list[dict], quantity: float) -> list[dict]:
+    remaining = float(quantity or 0)
+    result = []
+    for line in lines:
+        taken = min(float(line.get("qty") or 0), remaining)
+        if taken > 0:
+            result.append({**line, "qty": taken})
+            remaining -= taken
+        if remaining <= 0:
+            break
+    return result
 
 
 def _order_product_lines(db: Session, order_id: int) -> list[dict]:
@@ -495,7 +665,8 @@ def _with_shortage_line_uids(shortages: list[dict]) -> list[dict]:
     return [{**line, "line_uid": _shortage_line_uid(line, index)} for index, line in enumerate(shortages)]
 
 
-def _split_delivery_lines(shortages: list[dict], deliveries: list[dict]) -> tuple[list[dict], list[dict]]:
+def _split_delivery_lines(shortages: list[dict], deliveries: list[dict], *,
+                          allow_overage: bool = False) -> tuple[list[dict], list[dict]]:
     source_lines = _with_shortage_line_uids(shortages)
     remaining_qty = {
         line["line_uid"]: float(line.get("shortage_qty") or line.get("qty") or 0)
@@ -508,6 +679,7 @@ def _split_delivery_lines(shortages: list[dict], deliveries: list[dict]) -> tupl
         qty_left = float(delivery.get("qty") or 0)
         if qty_left <= 0:
             continue
+        accepted_start = len(accepted)
         delivery_uid = delivery.get("line_uid")
         candidate_lines = (
             [lines_by_uid[delivery_uid]]
@@ -533,6 +705,21 @@ def _split_delivery_lines(shortages: list[dict], deliveries: list[dict]) -> tupl
             })
             remaining_qty[line_uid] = line_remaining - qty
             qty_left -= qty
+        if allow_overage and qty_left > 0 and candidate_lines:
+            if len(accepted) > accepted_start:
+                accepted[-1]["qty"] = float(accepted[-1]["qty"]) + qty_left
+                accepted[-1]["shortage_qty"] = float(accepted[-1]["shortage_qty"]) + qty_left
+            else:
+                line = candidate_lines[0]
+                accepted.append({
+                    **line,
+                    "qty": qty_left,
+                    "shortage_qty": qty_left,
+                    "expected_date": delivery.get("expected_date"),
+                    "invoice": delivery.get("invoice"),
+                    "supplier": delivery.get("supplier"),
+                    "comment": delivery.get("comment"),
+                })
 
     remaining = []
     for line in source_lines:
@@ -768,7 +955,7 @@ def _create_repair_material_flow(db: Session, task: WorkflowTask, requested_mate
     active_statuses = ["assigned", "in_progress", "open", "waiting_delivery", "hold", "ready_to_issue"]
     active_children = db.query(WorkflowTask).filter(
         WorkflowTask.status.in_(active_statuses),
-        WorkflowTask.type.in_(["repair_issue_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
+        WorkflowTask.type.in_(["repair_issue_materials", "repair_receive_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
     ).all()
     for child_task in active_children:
         child_payload = child_task.payload or {}
@@ -817,7 +1004,7 @@ def _create_repair_material_flow(db: Session, task: WorkflowTask, requested_mate
             db,
             order_id=task.order_id,
             task_type="procurement_purchase",
-            title=f"Закупить компоненты для ремонта по заказу #{task.order_id}",
+            title=f"Закупить дополнительные компоненты для {source_label} по заказу #{task.order_id}",
             role="procurement",
             description=f"Закупить дополнительные компоненты, необходимые для устранения брака на этапе {source_label}.",
             payload={
@@ -826,7 +1013,7 @@ def _create_repair_material_flow(db: Session, task: WorkflowTask, requested_mate
                 "source_task_id": task.id,
                 "source_task_type": task.type,
                 "request_reason": request_reason,
-                "purpose": "repair",
+                "purpose": "assembly" if task.type == "assembler_build" else "repair",
             },
         )
         procurement_task_ids.append(procurement_task.id)
@@ -855,7 +1042,7 @@ def _open_repair_material_flow_exists(db: Session, repair_task_id: int) -> bool:
     active_statuses = ["assigned", "in_progress", "open", "waiting_delivery", "hold", "ready_to_issue"]
     tasks = db.query(WorkflowTask).filter(
         WorkflowTask.status.in_(active_statuses),
-        WorkflowTask.type.in_(["repair_issue_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
+        WorkflowTask.type.in_(["repair_issue_materials", "repair_receive_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
     ).all()
     return any(int((task.payload or {}).get("source_task_id") or 0) == repair_task_id for task in tasks)
 
@@ -864,7 +1051,7 @@ def _open_material_flow_tasks(db: Session, source_task_id: int) -> list[dict]:
     active_statuses = ["assigned", "in_progress", "open", "waiting_delivery", "hold", "ready_to_issue"]
     tasks = db.query(WorkflowTask).filter(
         WorkflowTask.status.in_(active_statuses),
-        WorkflowTask.type.in_(["repair_issue_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
+        WorkflowTask.type.in_(["repair_issue_materials", "repair_receive_materials", "procurement_purchase", "accounting_payment", "warehouse_receive_components"]),
     ).order_by(WorkflowTask.id.asc()).all()
     result = []
     for child_task in tasks:
@@ -1851,7 +2038,7 @@ def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | Non
 
     payload = task.payload or {}
     completion = payload.get("completion") or {}
-    finished_goods = payload.get("finished_goods") or []
+    finished_goods = pending_product_lines(db, task) or payload.get("finished_goods") or []
     accepted_lines = [
         line
         for line in completion.get("accepted_goods", [])
@@ -1909,10 +2096,15 @@ def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | Non
 
 def _order_finished_qty_by_product(db: Session, order_id: int) -> dict[int, float]:
     result = {}
-    movements = db.query(InventoryMovement).filter(
+    movements = db.query(InventoryMovement).join(
+        WorkflowTask,
+        WorkflowTask.id == InventoryMovement.task_id,
+    ).filter(
         InventoryMovement.order_id == order_id,
         InventoryMovement.direction == "incoming",
         InventoryMovement.product_id.isnot(None),
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "warehouse_finished_goods",
     ).all()
     for movement in movements:
         product_id = int(movement.product_id)
@@ -1924,7 +2116,7 @@ def _order_ready_blockers(db: Session, order_id: int) -> list[str]:
     blockers = []
     active_tasks = db.query(WorkflowTask).filter(
         WorkflowTask.order_id == order_id,
-        WorkflowTask.status.notin_(["done", "cancelled"]),
+        WorkflowTask.status.notin_(["done", "cancelled", "merged"]),
     ).all()
     if active_tasks:
         blockers.append("есть незавершенные задачи: " + ", ".join(f"#{task.id} {task.title}" for task in active_tasks[:5]))
@@ -1942,9 +2134,20 @@ def _order_ready_blockers(db: Session, order_id: int) -> list[str]:
 
 def _complete_procurement_task(db: Session, task: WorkflowTask, completion_payload: dict, order: Order | None):
     payload = task.payload or {}
-    shortages = payload.get("shortages", [])
+    shortages = [
+        {
+            **line,
+            "requested_qty": float(
+                line.get("requested_qty")
+                or line.get("shortage_qty")
+                or line.get("qty")
+                or 0
+            ),
+        }
+        for line in payload.get("shortages", [])
+    ]
     deliveries = _delivery_lines(completion_payload)
-    accepted_deliveries, remaining = _split_delivery_lines(shortages, deliveries)
+    accepted_deliveries, remaining = _split_delivery_lines(shortages, deliveries, allow_overage=True)
 
     if not accepted_deliveries:
         raise HTTPException(status_code=400, detail="Укажите хотя бы одну закупленную позицию")
@@ -1980,6 +2183,17 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
             role="accounting",
             description="Проверить счет закупщика, приложить оплаченное платежное поручение и передать поставку на приемку.",
             payload={
+                **({
+                    key: payload[key]
+                    for key in (
+                        "product_context",
+                        "source_task_id",
+                        "source_task_type",
+                        "request_reason",
+                        "purpose",
+                    )
+                    if payload.get(key) is not None
+                }),
                 "procurement_task_id": task.id,
                 "purchase_group_id": purchase_id,
                 "shortages": accounting_items,
@@ -2025,8 +2239,23 @@ def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: 
         raise HTTPException(status_code=400, detail="Укажите компонент и количество закупки")
 
     payload = task.payload or {}
-    shortages = payload.get("shortages", [])
-    purchased, remaining = _split_component_lines(shortages, {int(component_id): qty})
+    shortages = [
+        {
+            **line,
+            "requested_qty": float(
+                line.get("requested_qty")
+                or line.get("shortage_qty")
+                or line.get("qty")
+                or 0
+            ),
+        }
+        for line in payload.get("shortages", [])
+    ]
+    purchased, remaining = _split_delivery_lines(
+        shortages,
+        [{"component_id": int(component_id), "qty": qty}],
+        allow_overage=True,
+    )
     if not purchased:
         raise HTTPException(status_code=400, detail="По этой позиции нет остатка к закупке")
 
@@ -2061,6 +2290,17 @@ def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: 
         role="accounting",
         description="Проверить счет закупщика, приложить оплаченное платежное поручение и передать поставку на приемку.",
         payload={
+            **({
+                key: payload[key]
+                for key in (
+                    "product_context",
+                    "source_task_id",
+                    "source_task_type",
+                    "request_reason",
+                    "purpose",
+                )
+                if payload.get(key) is not None
+            }),
             "procurement_task_id": task.id,
             "purchase_group_id": purchase_id,
             "shortages": [{
@@ -2131,45 +2371,61 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
         "last_completion": completion_payload,
     }
 
-    if remaining:
-        if order:
-            order.status = "Awaiting Components"
-        return {"status": "partial", "remaining": remaining}
-
-    task.status = "done"
-    task.completed_at = datetime.utcnow()
-    task.payload = {**task.payload, "completion": completion_payload}
+    result_status = "partial" if remaining else "done"
+    if not remaining:
+        task.status = "done"
+        task.completed_at = datetime.utcnow()
+        task.payload = {**task.payload, "completion": completion_payload}
 
     if payload.get("source_task_id"):
+        previously_received = {}
+        for receipt in payload.get("receipt_history") or []:
+            for line in receipt.get("items") or []:
+                key = line.get("purchase_id") or line.get("line_uid") or int(line["component_id"])
+                previously_received[key] = previously_received.get(key, 0) + float(line.get("qty") or 0)
+        received_for_issue = []
+        for line in received:
+            key = line.get("purchase_id") or line.get("line_uid") or int(line["component_id"])
+            received_before = float(previously_received.get(key, 0))
+            received_now = float(line.get("qty") or line.get("shortage_qty") or 0)
+            requested_qty = float(line.get("requested_qty") or received_now)
+            issue_qty = min(received_before + received_now, requested_qty) - min(received_before, requested_qty)
+            if issue_qty > 0:
+                received_for_issue.append({**line, "qty": issue_qty, "shortage_qty": issue_qty})
         product_context = payload.get("product_context") or _product_context_from_line(received[0])
         context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
-        reserve_components(db, received)
-        for material in received:
-            db.add(Reservation(
+        if received_for_issue:
+            reserve_components(db, received_for_issue)
+            for material in received_for_issue:
+                db.add(Reservation(
+                    order_id=task.order_id,
+                    component_id=material["component_id"],
+                    qty=material["qty"],
+                ))
+            source_role = "assembler" if payload.get("source_task_type") == "assembler_build" else "repair_engineer"
+            create_task(
+                db,
                 order_id=task.order_id,
-                component_id=material["component_id"],
-                qty=material["qty"],
-            ))
-        source_role = "assembler" if payload.get("source_task_type") == "assembler_build" else "repair_engineer"
-        create_task(
-            db,
-            order_id=task.order_id,
-            task_type="repair_issue_materials",
-            title=f"Выдать поступившие доп. компоненты по заказу #{task.order_id}{context_label}",
-            role="warehouse",
-            description="Выдать поступившие дополнительные компоненты по заявке производства.",
-            payload={
-                **({"product_context": product_context} if product_context else {}),
-                "source_task_id": payload.get("source_task_id"),
-                "source_task_type": payload.get("source_task_type"),
-                "counterparty_role": source_role,
-                "materials": enrich_component_lines(db, received),
-                "partial": False,
-            },
-        )
+                task_type="repair_issue_materials",
+                title=f"Выдать поступившие доп. компоненты по заказу #{task.order_id}{context_label}",
+                role="warehouse",
+                description="Выдать дополнительные компоненты по заявке производства; излишек закупки остается на складе.",
+                payload={
+                    **({"product_context": product_context} if product_context else {}),
+                    "source_task_id": payload.get("source_task_id"),
+                    "source_task_type": payload.get("source_task_type"),
+                    "counterparty_role": source_role,
+                    "materials": enrich_component_lines(db, received_for_issue),
+                    "partial": bool(remaining),
+                },
+            )
         if order:
-            order.status = "Components Available"
-        return {"status": "done"}
+            order.status = (
+                "Repair Required"
+                if payload.get("source_task_type") == "repair_defects"
+                else "Components Available"
+            )
+        return {"status": result_status, **({"remaining": remaining} if remaining else {})}
 
     grouped_received = _group_lines_by_product_context(received)
     if any(product_context for product_context, _ in grouped_received):
@@ -2181,12 +2437,17 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
                 lines,
                 title=f"Выдать поступившие комплектующие по заказу #{task.order_id}{context_label}",
                 description="Передать сборщику поступившие комплектующие по этой позиции заказа.",
-                partial=False,
+                partial=bool(remaining),
                 product_context=product_context,
             )
         if order:
             order.status = "Components Available"
-        return {"status": "done"}
+        return {"status": result_status, **({"remaining": remaining} if remaining else {})}
+
+    if remaining:
+        if order:
+            order.status = "Awaiting Components"
+        return {"status": "partial", "remaining": remaining}
 
     materials = _remaining_order_materials(db, task.order_id)
     stock_shortages = find_shortages(db, materials)
@@ -2559,6 +2820,7 @@ def _complete_assembler_build_task(
         description="Отметить годные и бракованные изделия.",
         payload={
             **({"product_context": product_context} if product_context else {}),
+            "source_assembly_task_id": task.id,
             "assembled_qty": assembled_qty,
             "planned_qty": target_qty,
             "product_lines": product_lines_for_test,
@@ -2572,8 +2834,8 @@ def _complete_assembler_build_task(
     }
 
 
-def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | None = None,
-                  actor_user_id: int | None = None):
+def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dict | None = None,
+                        actor_user_id: int | None = None):
     if task.status == "done":
         raise HTTPException(status_code=400, detail="Задача уже закрыта")
 
@@ -2599,6 +2861,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
     if task.type == "warehouse_issue_materials":
         task.payload = {**payload, "completion": completion_payload}
         _issue_reserved_materials(db, task.order_id, task, actor_user_id, counterparty_role="assembler")
+        transfer = _mark_material_transfer_issued(db, task, "assembler", actor_user_id)
         db.flush()
         product_context = payload.get("product_context")
         remaining_materials = []
@@ -2622,7 +2885,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
             context_label = ""
         task.status = "ready_to_issue"
         task.completed_at = None
-        create_task(
+        receive_task = create_task(
             db,
             order_id=task.order_id,
             task_type="assembler_receive_materials",
@@ -2636,6 +2899,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                 "partial": partial,
             },
         )
+        _attach_material_transfer_receipt(db, transfer, receive_task)
         return {"status": "ready_to_issue"}
 
     task.payload = {**payload, "completion": completion_payload}
@@ -2643,6 +2907,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
     task.completed_at = datetime.utcnow()
 
     if task.type == "assembler_receive_materials":
+        _accept_material_transfer(db, task, actor_user_id)
         source_issue_task_id = payload.get("source_issue_task_id")
         movement_query = db.query(InventoryMovement).filter(
             InventoryMovement.order_id == task.order_id,
@@ -2657,7 +2922,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         if source_issue_task_id:
             issue_task = db.query(WorkflowTask).filter(
                 WorkflowTask.id == int(source_issue_task_id),
-                WorkflowTask.type == "warehouse_issue_materials",
+                WorkflowTask.type.in_(["warehouse_issue_materials", "repair_issue_materials"]),
                 WorkflowTask.status == "ready_to_issue",
             ).first()
             if issue_task:
@@ -2713,17 +2978,80 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                 _ensure_assembly_task(db, order, materials_complete)
 
     elif task.type == "repair_issue_materials":
+        recipient_role = payload.get("counterparty_role") or "repair_engineer"
         _issue_reserved_materials(
             db,
             task.order_id,
             task,
             actor_user_id,
-            counterparty_role=payload.get("counterparty_role") or "repair_engineer",
+            counterparty_role=recipient_role,
         )
+        transfer = _mark_material_transfer_issued(db, task, recipient_role, actor_user_id)
+        db.flush()
+        task.status = "ready_to_issue"
+        task.completed_at = None
+        product_context = payload.get("product_context")
+        context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
+        is_assembly_request = payload.get("source_task_type") == "assembler_build"
+        receive_task = create_task(
+            db,
+            order_id=task.order_id,
+            task_type="assembler_receive_materials" if is_assembly_request else "repair_receive_materials",
+            title=(
+                f"Получить дополнительные компоненты для сборки по заказу #{task.order_id}{context_label}"
+                if is_assembly_request
+                else f"Получить дополнительные компоненты для ремонта по заказу #{task.order_id}{context_label}"
+            ),
+            role="assembler" if is_assembly_request else "repair_engineer",
+            description=(
+                "Подтвердить получение дополнительных компонентов от склада перед продолжением сборки."
+                if is_assembly_request
+                else "Подтвердить получение дополнительных компонентов от склада перед продолжением ремонта."
+            ),
+            payload={
+                **({"product_context": product_context} if product_context else {}),
+                "source_task_id": payload.get("source_task_id"),
+                "source_task_type": payload.get("source_task_type"),
+                "source_issue_task_id": task.id,
+                "request_reason": payload.get("request_reason"),
+                "materials": payload.get("materials", []),
+            },
+        )
+        _attach_material_transfer_receipt(db, transfer, receive_task)
+        if order:
+            order.status = "In Assembly" if is_assembly_request else "Repair Required"
+        return {"status": "ready_to_issue", "receive_task_id": receive_task.id}
+
+    elif task.type == "repair_receive_materials":
+        _accept_material_transfer(db, task, actor_user_id)
+        source_issue_task_id = payload.get("source_issue_task_id")
+        movement_query = db.query(InventoryMovement).filter(
+            InventoryMovement.order_id == task.order_id,
+            InventoryMovement.direction == "outgoing",
+            InventoryMovement.counterparty_role == "repair_engineer",
+            InventoryMovement.counterparty_user_id.is_(None),
+        )
+        if source_issue_task_id:
+            movement_query = movement_query.filter(InventoryMovement.task_id == int(source_issue_task_id))
+        for movement in movement_query.all():
+            movement.counterparty_user_id = actor_user_id
+        if source_issue_task_id:
+            issue_task = db.query(WorkflowTask).filter(
+                WorkflowTask.id == int(source_issue_task_id),
+                WorkflowTask.type == "repair_issue_materials",
+                WorkflowTask.status == "ready_to_issue",
+            ).first()
+            if issue_task:
+                issue_task.status = "done"
+                issue_task.completed_at = datetime.utcnow()
+        if order:
+            order.status = "Repair Required"
 
     elif task.type == "tester_check":
         product_context = payload.get("product_context")
-        product_lines = payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        product_lines = pending_product_lines(db, task) or (
+            payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        )
         test_total_qty = sum(float(item.get("qty") or 0) for item in product_lines)
         defective_products = [
             {
@@ -2755,6 +3083,36 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                 order.status = "Repair Required"
             defective_product_ids = [item["product_id"] for item in defective_products]
             context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
+            defective_by_product = {
+                int(item["product_id"]): int(item.get("defective_qty") or 0)
+                for item in defective_products
+            }
+            passed_product_lines = []
+            remaining_legacy_defects = defective_qty if not defective_products else 0
+            for line in product_lines:
+                line_qty = float(line.get("qty") or 0)
+                product_id = int(line["product_id"]) if line.get("product_id") else None
+                line_defective = defective_by_product.get(product_id, 0) if product_id else 0
+                if remaining_legacy_defects > 0:
+                    line_defective = min(line_qty, remaining_legacy_defects)
+                    remaining_legacy_defects -= line_defective
+                line_passed = max(line_qty - line_defective, 0)
+                if line_passed > 0:
+                    passed_product_lines.append({**line, "qty": line_passed})
+            if passed_product_lines:
+                create_task(
+                    db,
+                    order_id=task.order_id,
+                    task_type="packer_pack",
+                    title=f"Упаковать годные изделия по заказу #{task.order_id}{context_label}",
+                    role="packer",
+                    description="Упаковать изделия, успешно прошедшие тестирование; бракованная часть партии передана в ремонт.",
+                    payload={
+                        **({"product_context": product_context} if product_context else {}),
+                        "source_test_task_id": task.id,
+                        "product_lines": passed_product_lines,
+                    },
+                )
             create_task(
                 db,
                 order_id=task.order_id,
@@ -2786,13 +3144,33 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                     "product_lines": product_lines,
                 },
             )
+        consume_workflow_batches(db, task, tested_qty)
+        upstream_open = (
+            _active_primary_testing_exists(db, task.order_id, exclude_task_id=task.id)
+            if payload.get("retest")
+            else _active_stage_exists(db, task.order_id, ["assembler_build"], exclude_task_id=task.id)
+        )
+        remaining = batch_summary(db, task)["pending_qty"]
+        if upstream_open or remaining > 0:
+            history = list(payload.get("completion_history") or [])
+            history.append({**completion_payload, "processed_qty": tested_qty, "completed_at": datetime.utcnow().isoformat()})
+            task.payload = {**task.payload, "completion": {}, "completion_history": history}
+            task.status = "assigned"
+            task.completed_at = None
 
     elif task.type == "repair_defects":
         material_flow = _create_repair_material_flow(db, task, completion_payload.get("extra_components") or [])
         if material_flow.get("created"):
             task.status = "in_progress"
             task.completed_at = None
-            task.payload = {**(task.payload or {}), "last_completion": completion_payload}
+            task.payload = {
+                **(task.payload or {}),
+                "completion": {
+                    **completion_payload,
+                    "extra_components": [],
+                },
+                "last_completion": completion_payload,
+            }
             if order:
                 order.status = "Repair Required"
             return {
@@ -2802,34 +3180,58 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
             }
         if _open_repair_material_flow_exists(db, task.id):
             raise HTTPException(status_code=400, detail="Сначала нужно закрыть выдачу, закупку и приемку дополнительных компонентов для ремонта")
-        if order:
-            order.status = "Ready For Packing"
         product_context = payload.get("product_context")
         context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
+        repair_pending_lines = pending_product_lines(db, task)
+        repaired_product_lines = [
+            {
+                "product_id": item.get("product_id"),
+                "product_name": item.get("product_name"),
+                "drawing_number": item.get("drawing_number"),
+                "qty": int(item.get("qty") or item.get("defective_qty") or 0),
+                "test_checklist": _product_test_checklist(db, item.get("product_id")),
+            }
+            for item in (repair_pending_lines or payload.get("defective_products") or [])
+            if item.get("product_id") and int(item.get("qty") or item.get("defective_qty") or 0) > 0
+        ] or [
+            {
+                **item,
+                "test_checklist": _product_test_checklist(db, item.get("product_id")),
+            }
+            for item in (payload.get("product_lines") or _order_product_lines(db, task.order_id))
+        ]
+        task_checklist = repaired_product_lines[0].get("test_checklist") if len(repaired_product_lines) == 1 else []
+        if order:
+            order.status = "Quality Check"
         create_task(
             db,
             order_id=task.order_id,
-            task_type="packer_pack",
-            title=f"Упаковать изделия по заказу #{task.order_id}{context_label}",
-            role="packer",
-            description="Упаковать исправленные изделия и передать на склад готовой продукции.",
+            task_type="tester_check",
+            title=f"Повторно протестировать изделия после ремонта по заказу #{task.order_id}{context_label}",
+            role="tester",
+            description="Проверить отремонтированные изделия. На упаковку передаются только изделия, успешно прошедшие повторное тестирование.",
             payload={
                 **({"product_context": product_context} if product_context else {}),
-                "product_lines": [
-                    {
-                        "product_id": item.get("product_id"),
-                        "product_name": item.get("product_name"),
-                        "drawing_number": item.get("drawing_number"),
-                        "qty": int(item.get("defective_qty") or 0),
-                    }
-                    for item in (payload.get("defective_products") or [])
-                    if item.get("product_id") and int(item.get("defective_qty") or 0) > 0
-                ] or payload.get("product_lines") or _order_product_lines(db, task.order_id),
+                "source_repair_task_id": task.id,
+                "retest": True,
+                "repair_notes": completion_payload.get("notes"),
+                "product_lines": repaired_product_lines,
+                "test_checklist": task_checklist,
             },
         )
+        repaired_qty = sum(float(line.get("qty") or 0) for line in repaired_product_lines)
+        consume_workflow_batches(db, task, repaired_qty)
+        if batch_summary(db, task)["pending_qty"] > 0:
+            history = list(payload.get("completion_history") or [])
+            history.append({**completion_payload, "processed_qty": repaired_qty, "completed_at": datetime.utcnow().isoformat()})
+            task.payload = {**task.payload, "completion": {}, "completion_history": history}
+            task.status = "assigned"
+            task.completed_at = None
 
     elif task.type == "packer_pack":
-        product_lines = payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        product_lines = pending_product_lines(db, task) or (
+            payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        )
         available_qty = sum(float(item.get("qty") or 0) for item in product_lines)
         packed_qty = float(completion_payload.get("packed_qty") or 0)
         if available_qty <= 0:
@@ -2841,8 +3243,7 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
                 status_code=400,
                 detail=f"Нельзя упаковать {packed_qty:g} шт.: доступно {available_qty:g} шт.",
             )
-        if len(product_lines) == 1:
-            product_lines = [{**product_lines[0], "qty": packed_qty}]
+        product_lines = _take_product_quantity(product_lines, packed_qty)
         if order:
             order.status = "Finished Goods"
         product_context = payload.get("product_context")
@@ -2856,18 +3257,73 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
             description="Поставить готовые изделия на баланс склада готовой продукции.",
             payload={
                 **({"product_context": product_context} if product_context else {}),
+                "source_pack_task_id": task.id,
                 "packed_qty": completion_payload.get("packed_qty"),
                 "finished_goods": product_lines,
             },
         )
+        consume_workflow_batches(db, task, packed_qty)
+        remaining = batch_summary(db, task)["pending_qty"]
+        if remaining > 0 or _active_stage_exists(
+            db, task.order_id, ["tester_check", "repair_defects"], exclude_task_id=task.id
+        ):
+            history = list(payload.get("completion_history") or [])
+            history.append({**completion_payload, "processed_qty": packed_qty, "completed_at": datetime.utcnow().isoformat()})
+            task.payload = {**task.payload, "completion": {}, "completion_history": history}
+            task.status = "assigned"
+            task.completed_at = None
 
     elif task.type == "warehouse_finished_goods":
         _receive_finished_goods(db, task.order_id, task, actor_user_id)
+        accepted_qty = sum(float(line.get("qty") or 0) for line in completion_payload.get("accepted_goods") or [])
+        consume_workflow_batches(db, task, accepted_qty)
+        db.flush()
+        remaining = batch_summary(db, task)["pending_qty"]
+        if remaining > 0 or _active_stage_exists(db, task.order_id, ["packer_pack"], exclude_task_id=task.id):
+            history = list(payload.get("completion_history") or [])
+            history.append({**completion_payload, "processed_qty": accepted_qty, "completed_at": datetime.utcnow().isoformat()})
+            task.payload = {**task.payload, "completion": {}, "completion_history": history}
+            task.status = "assigned"
+            task.completed_at = None
         if order:
             blockers = _order_ready_blockers(db, task.order_id)
             if blockers:
                 order.status = "Finished Goods"
-                raise HTTPException(status_code=400, detail="Заказ нельзя закрыть: " + "; ".join(blockers))
-            order.status = "Ready To Ship"
+                return {
+                    "status": "done",
+                    "order_status": order.status,
+                    "order_blockers": blockers,
+                }
+            else:
+                order.status = "Ready To Ship"
 
     return {"status": "done"}
+
+
+def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | None = None,
+                  actor_user_id: int | None = None):
+    """Единая точка перехода: маршрут, количества и партии фиксируются централизованно."""
+    completion_payload = completion_payload or {}
+    sync_task_quantities(db, task)
+    existing_ids = {
+        row[0] for row in db.query(WorkflowTask.id).filter(WorkflowTask.order_id == task.order_id).all()
+    }
+    result = _complete_task_impl(db, task, completion_payload, actor_user_id)
+    db.flush()
+    new_tasks = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == task.order_id,
+        ~WorkflowTask.id.in_(existing_ids) if existing_ids else WorkflowTask.id.isnot(None),
+    ).all()
+    for new_task in new_tasks:
+        validate_transition(task.type, new_task.type)
+        sync_task_quantities(db, new_task)
+    sync_task_quantities(db, task)
+    record_completion_batch(db, task, completion_payload)
+    if task.type in ACCUMULATIVE_TYPES and task.status != "done":
+        result = {
+            **(result or {}),
+            "status": "partial",
+            "message": "Партия обработана; накопительная задача остается открытой для следующих поступлений",
+            "batch_summary": batch_summary(db, task),
+        }
+    return result

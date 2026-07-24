@@ -3,6 +3,8 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+import hashlib
+import json
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -13,10 +15,11 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.auth import User
-from app.models.production import WorkflowTask
+from app.models.production import MaterialTransfer, WorkflowCommand, WorkflowTask
 from app.services.auth_service import get_current_user, require_roles, user_has_role, user_roles
 from app.services.workflow_service import _open_material_flow_tasks, add_procurement_purchase, cleanup_premature_assembly_tasks, complete_task, enrich_component_lines, ensure_assembly_tasks_after_receipts, ensure_missing_order_item_workflows, ensure_procurement_payment_tasks, merge_order_procurement_tasks, normalize_assembly_task_payload, normalize_task_daily_progress, reconcile_procurement_tasks_with_stock, reconcile_stock_reservations, split_aggregate_assembly_tasks
 from app.services.xlsx_service import build_table_xlsx
+from app.services.workflow_batch_service import ACCUMULATIVE_TYPES, batch_summary, pending_product_lines
 
 router = APIRouter(prefix="/tasks", tags=["Workflow задачи"])
 UPLOAD_ROOT = Path("uploads/tasks")
@@ -24,6 +27,7 @@ UPLOAD_ROOT = Path("uploads/tasks")
 
 class TaskCompletePayload(BaseModel):
     payload: Optional[dict] = None
+    idempotency_key: Optional[str] = None
 
 
 class TaskNotePayload(BaseModel):
@@ -69,6 +73,9 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
     assigned_user = db.get(User, task.assigned_user_id) if db and task.assigned_user_id else None
     if db:
         payload = {**payload}
+        if task.type in ACCUMULATIVE_TYPES:
+            payload["batch_summary"] = batch_summary(db, task)
+            payload["pending_product_lines"] = pending_product_lines(db, task)
         if payload.get("shortages"):
             payload["shortages"] = enrich_component_lines(db, payload["shortages"])
         if payload.get("materials"):
@@ -85,6 +92,30 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
                 }
                 for entry in payload["receipt_history"]
             ]
+        transfer_id = payload.get("material_transfer_id")
+        if transfer_id:
+            transfer = db.query(MaterialTransfer).filter(MaterialTransfer.id == int(transfer_id)).first()
+            if transfer:
+                payload["material_transfer"] = {
+                    "id": transfer.id,
+                    "status": transfer.status,
+                    "recipient_role": transfer.recipient_role,
+                    "source_task_id": transfer.source_task_id,
+                    "source_task_type": transfer.source_task_type,
+                    "issue_task_id": transfer.issue_task_id,
+                    "receive_task_id": transfer.receive_task_id,
+                    "lines": [
+                        {
+                            "component_id": line.component_id,
+                            "line_uid": line.line_uid,
+                            "requested_qty": line.requested_qty,
+                            "reserved_qty": line.reserved_qty,
+                            "issued_qty": line.issued_qty,
+                            "accepted_qty": line.accepted_qty,
+                        }
+                        for line in transfer.lines
+                    ],
+                }
         if payload.get("assembly_assignments"):
             payload["assembly_assignments"] = [
                 {
@@ -137,11 +168,11 @@ def download_material_task_form(
         raise HTTPException(status_code=404, detail="Задача не найдена")
     if not _can_access_task(task, user):
         raise HTTPException(status_code=403, detail="Эта задача назначена другой роли")
-    if task.type not in ["warehouse_issue_materials", "assembler_receive_materials", "repair_issue_materials"]:
+    if task.type not in ["warehouse_issue_materials", "assembler_receive_materials", "repair_issue_materials", "repair_receive_materials"]:
         raise HTTPException(status_code=400, detail="Для этой задачи форма не предусмотрена")
 
     materials = enrich_component_lines(db, (task.payload or {}).get("materials") or [])
-    is_issue = task.type != "assembler_receive_materials"
+    is_issue = task.type not in ["assembler_receive_materials", "repair_receive_materials"]
     action = "Выдача" if is_issue else "Получение"
     rows = [[
         index,
@@ -609,12 +640,33 @@ def complete_workflow_task(
         raise HTTPException(status_code=404, detail="Задача не найдена")
     if not _can_access_task(task, user):
         raise HTTPException(status_code=403, detail="Эта задача назначена другой роли")
+    request_body = payload.payload or {}
+    request_hash = hashlib.sha256(
+        json.dumps(request_body, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+    if payload.idempotency_key:
+        previous = db.query(WorkflowCommand).filter_by(
+            task_id=task.id, idempotency_key=payload.idempotency_key,
+        ).first()
+        if previous:
+            if previous.request_hash != request_hash:
+                raise HTTPException(status_code=409, detail="Ключ повтора уже использован с другим содержимым")
+            return previous.response_payload
     allowed_statuses = ["in_progress", "open"]
     if task.type == "assembler_build":
         allowed_statuses.append("assigned")
     if task.status not in allowed_statuses or not _can_work_task(task, user):
         raise HTTPException(status_code=400, detail="Сначала задачу нужно взять в работу")
 
-    result = complete_task(db, task, payload.payload, actor_user_id=user.id)
+    result = complete_task(db, task, request_body, actor_user_id=user.id)
+    response = {"status": "success", "task_id": task.id, "result": result}
+    if payload.idempotency_key:
+        db.add(WorkflowCommand(
+            task_id=task.id,
+            idempotency_key=payload.idempotency_key,
+            command_type="complete",
+            request_hash=request_hash,
+            response_payload=response,
+        ))
     db.commit()
-    return {"status": "success", "task_id": task.id, "result": result}
+    return response
