@@ -20,7 +20,14 @@ def aggregate_order_progress(db: Session, order: Order) -> dict:
         sum(float(line.get("qty") or 0) for line in ((task.payload or {}).get("finished_goods") or []))
         for task in finished_tasks
     )
-    if total and done == total:
+    if order.cancellation_status in {"cancelled", "cancelled_with_commitments"}:
+        state = order.cancellation_status
+        label = "Отменён с обязательствами" if order.cancellation_status == "cancelled_with_commitments" else "Отменён"
+    elif order.cancellation_status == "settlement":
+        state, label = "settlement", "Урегулирование отмены"
+    elif order.cancellation_status == "cancellation_requested":
+        state, label = "cancellation_requested", "Запрошена отмена"
+    elif total and done == total:
         state = "completed"
         label = "Готов к отгрузке"
         percent = 100

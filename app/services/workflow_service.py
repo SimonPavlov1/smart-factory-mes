@@ -1,11 +1,12 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.inventory import Component, InventoryMovement, Stock
 from app.models.auth import User
+from app.time_utils import utcnow
 from app.models.production import (
     MaterialTransfer,
     MaterialTransferLine,
@@ -13,12 +14,14 @@ from app.models.production import (
     OrderItem,
     ProductBOM,
     ProductType,
+    Item,
     Reservation,
     WorkflowTask,
 )
 from app.services.production_planning import get_bom_requirements
 from app.services.reservation_service import reserve_components
 from app.services.inventory_movement_service import record_movement
+from app.services.factory_number_service import create_product_units
 from app.services.quantity_service import record_completion_batch, sync_task_quantities
 from app.services.workflow_routes import validate_task_role, validate_transition
 from app.services.workflow_batch_service import (
@@ -38,6 +41,21 @@ def create_task(db: Session, *, order_id: int, task_type: str, title: str, role:
     payload = payload or {}
     accumulator = find_accumulative_task(db, order_id, task_type, payload)
     if accumulator:
+        accumulator.title = title
+        accumulator.description = description
+        accumulator.role = role
+        if accumulator.status == "done":
+            current = accumulator.payload or {}
+            completion = current.get("completion")
+            if completion:
+                history = list(current.get("completion_history") or [])
+                history.append({
+                    **completion,
+                    "completed_at": accumulator.completed_at.isoformat() if accumulator.completed_at else utcnow().isoformat(),
+                })
+                accumulator.payload = {**current, "completion": {}, "completion_history": history}
+            accumulator.status = "assigned"
+            accumulator.completed_at = None
         merge_accumulative_payload(accumulator, payload)
         record_workflow_batch(db, accumulator, payload)
         return accumulator
@@ -55,6 +73,21 @@ def create_task(db: Session, *, order_id: int, task_type: str, title: str, role:
     if task_type in ACCUMULATIVE_TYPES:
         record_workflow_batch(db, task, payload)
     return task
+
+
+def _pending_or_legacy_product_lines(
+    db: Session,
+    task: WorkflowTask,
+    payload_key: str,
+    *,
+    aggregate_all: bool = False,
+) -> list[dict]:
+    pending = pending_product_lines(db, task, aggregate_all=aggregate_all)
+    if pending:
+        return pending
+    if batch_summary(db, task)["batches_total"] > 0:
+        return []
+    return list((task.payload or {}).get(payload_key) or [])
 
 
 def _material_transfer_payload(transfer: MaterialTransfer) -> dict:
@@ -118,7 +151,7 @@ def _mark_material_transfer_issued(db: Session, issue_task: WorkflowTask, recipi
         raise HTTPException(status_code=400, detail="Передача компонентов уже подтверждена получателем")
     transfer.status = "issued"
     transfer.issued_by_user_id = actor_user_id
-    transfer.issued_at = transfer.issued_at or datetime.utcnow()
+    transfer.issued_at = transfer.issued_at or utcnow()
     for line in transfer.lines:
         line.issued_qty = line.reserved_qty
     db.flush()
@@ -153,7 +186,7 @@ def _accept_material_transfer(db: Session, receive_task: WorkflowTask, actor_use
         raise HTTPException(status_code=400, detail="Складская выдача еще не проведена или передача уже подтверждена")
     transfer.status = "accepted"
     transfer.accepted_by_user_id = actor_user_id
-    transfer.accepted_at = datetime.utcnow()
+    transfer.accepted_at = utcnow()
     for line in transfer.lines:
         line.accepted_qty = line.issued_qty
     receive_task.payload = {
@@ -202,6 +235,31 @@ def _active_stage_exists(db: Session, order_id: int, task_types: list[str], excl
     if exclude_task_id:
         query = query.filter(WorkflowTask.id != exclude_task_id)
     return bool(query.first())
+
+
+def _active_stage_exists_for_context(
+    db: Session,
+    order_id: int,
+    task_types: list[str],
+    product_context: dict | None,
+    exclude_task_id: int | None = None,
+) -> bool:
+    if not product_context:
+        return _active_stage_exists(db, order_id, task_types, exclude_task_id)
+    query = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type.in_(task_types),
+        WorkflowTask.status.in_(["assigned", "open", "in_progress", "hold", "ready_to_issue"]),
+    )
+    if exclude_task_id:
+        query = query.filter(WorkflowTask.id != exclude_task_id)
+    return any(
+        _product_context_matches(
+            product_context,
+            (candidate.payload or {}).get("product_context") or {},
+        )
+        for candidate in query.all()
+    )
 
 
 def _active_primary_testing_exists(db: Session, order_id: int, exclude_task_id: int | None = None) -> bool:
@@ -315,6 +373,19 @@ def _collect_product_documents_for_product(db: Session, product_id: int) -> list
 
 def _order_bom_component_options(db: Session, order_id: int, product_ids: list[int] | None = None) -> list[dict]:
     options = {}
+
+    def merge_designators(*values: str | None) -> str | None:
+        result = []
+        seen = set()
+        for value in values:
+            for designator in str(value or "").split(","):
+                normalized = designator.strip()
+                key = normalized.casefold()
+                if normalized and key not in seen:
+                    seen.add(key)
+                    result.append(normalized)
+        return ", ".join(result) or None
+
     query = db.query(OrderItem).filter(OrderItem.order_id == order_id)
     if product_ids:
         query = query.filter(OrderItem.product_id.in_(product_ids))
@@ -327,7 +398,7 @@ def _order_bom_component_options(db: Session, order_id: int, product_ids: list[i
                 options[component_id]["required_qty"] += qty
                 if designators:
                     existing = options[component_id].get("designators")
-                    options[component_id]["designators"] = f"{existing}, {designators}" if existing else designators
+                    options[component_id]["designators"] = merge_designators(existing, designators)
                 return
             component = db.query(Component).filter(Component.id == component_id).first()
             options[component_id] = {
@@ -340,7 +411,7 @@ def _order_bom_component_options(db: Session, order_id: int, product_ids: list[i
                 "required_qty": qty,
                 "device": device,
                 "assembly": assembly,
-                "designators": designators,
+                "designators": merge_designators(designators),
             }
 
         def walk_product(product_id: int, multiplier: float, assembly: str | None = None, visited=None):
@@ -386,8 +457,8 @@ def normalize_task_daily_progress(task: WorkflowTask):
     if task.type != "assembler_build" or task.status == "done":
         return payload
 
-    start = (task.started_at or task.created_at or datetime.utcnow()).date()
-    yesterday = datetime.utcnow().date() - timedelta(days=1)
+    start = (task.started_at or task.created_at or utcnow()).date()
+    yesterday = utcnow().date() - timedelta(days=1)
     existing_dates = {entry.get("date") for entry in progress}
     current = start
     while current <= yesterday:
@@ -663,6 +734,32 @@ def _shortage_line_uid(line: dict, index: int) -> str:
 
 def _with_shortage_line_uids(shortages: list[dict]) -> list[dict]:
     return [{**line, "line_uid": _shortage_line_uid(line, index)} for index, line in enumerate(shortages)]
+
+
+def _deduplicate_shortage_lines(shortages: list[dict]) -> list[dict]:
+    """Collapse the same shortage line when duplicate procurement tasks are merged."""
+    unique_lines = []
+    index_by_uid = {}
+    for line in _with_shortage_line_uids(shortages):
+        line_uid = line["line_uid"]
+        existing_index = index_by_uid.get(line_uid)
+        if existing_index is None:
+            index_by_uid[line_uid] = len(unique_lines)
+            unique_lines.append(line)
+            continue
+
+        existing = unique_lines[existing_index]
+        existing_qty = float(existing.get("shortage_qty") or existing.get("qty") or 0)
+        incoming_qty = float(line.get("shortage_qty") or line.get("qty") or 0)
+        shortage_qty = max(existing_qty, incoming_qty)
+        unique_lines[existing_index] = {
+            **line,
+            **existing,
+            "line_uid": line_uid,
+            "shortage_qty": shortage_qty,
+            "qty": shortage_qty,
+        }
+    return unique_lines
 
 
 def _split_delivery_lines(shortages: list[dict], deliveries: list[dict], *,
@@ -1020,7 +1117,7 @@ def _create_repair_material_flow(db: Session, task: WorkflowTask, requested_mate
 
     requests = list(payload.get("material_requests") or [])
     requests.append({
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
         "items": enrich_component_lines(db, materials),
         "available": enrich_component_lines(db, available_materials),
         "shortages": shortages,
@@ -1388,6 +1485,110 @@ def _assembly_materials_complete(db: Session, order_id: int, exclude_receipt_id:
     return query.first() is None
 
 
+def ensure_assembly_device_pool(db: Session, task: WorkflowTask) -> WorkflowTask:
+    """Create and attach the unassigned device pool for a regular assembly task."""
+    if task.type != "assembler_build" or not task.order_id:
+        return task
+
+    payload = task.payload or {}
+    context = payload.get("product_context") or {}
+    product_id = context.get("product_id")
+    order_item_id = context.get("order_item_id")
+    planned_qty = max(int(float(payload.get("planned_qty") or context.get("qty") or 0)), 0)
+    if not product_id or planned_qty <= 0:
+        return task
+
+    units = (
+        db.query(Item)
+        .filter(Item.assembly_task_id == task.id)
+        .order_by(Item.id.asc())
+        .all()
+    )
+    missing_qty = planned_qty - len(units)
+    if missing_qty > 0:
+        product = db.query(ProductType).filter(ProductType.id == int(product_id)).first()
+        if not product:
+            return task
+        units.extend(create_product_units(
+            db,
+            order_id=task.order_id,
+            order_item_id=int(order_item_id) if order_item_id else None,
+            product=product,
+            assembly_task_id=task.id,
+            assigned_user_id=None,
+            quantity=missing_qty,
+        ))
+
+    valid_serials = {unit.serial_number for unit in units}
+    claims = {
+        serial_number: user_id
+        for serial_number, user_id in (payload.get("assembly_claims") or {}).items()
+        if serial_number in valid_serials
+    }
+    task.payload = {
+        **payload,
+        "unit_ids": [unit.id for unit in units],
+        "serial_numbers": [unit.serial_number for unit in units],
+        "assembly_claims": claims,
+    }
+    product = db.query(ProductType).filter(ProductType.id == int(product_id)).first()
+    if product and product.requires_preassembly_test and not task.payload.get("preassembly_test_completed"):
+        existing_pretest = db.query(WorkflowTask).filter(
+            WorkflowTask.order_id == task.order_id,
+            WorkflowTask.type == "tester_check",
+        ).all()
+        existing_pretest = next((
+            candidate for candidate in existing_pretest
+            if (candidate.payload or {}).get("pre_assembly")
+            and int((candidate.payload or {}).get("source_assembly_task_id") or 0) == task.id
+            and candidate.status in ["assigned", "open", "in_progress", "hold"]
+        ), None)
+        if not existing_pretest:
+            checklist = _product_test_checklist(db, product.id)
+            for unit in units:
+                if unit.status in ["planned", "in_assembly"]:
+                    unit.status = "testing"
+            existing_pretest = create_task(
+                db,
+                order_id=task.order_id,
+                task_type="tester_check",
+                title=f"Предварительно протестировать {product.name} по заказу #{task.order_id}",
+                role="tester",
+                description="Проверить устройства до установки в корпус. Годные устройства вернутся в пул сборки.",
+                payload={
+                    "product_context": context,
+                    "source_assembly_task_id": task.id,
+                    "pre_assembly": True,
+                    "planned_qty": planned_qty,
+                    "product_lines": [{
+                        "order_item_id": order_item_id,
+                        "product_id": product.id,
+                        "product_name": product.name,
+                        "drawing_number": product.drawing_number,
+                        "qty": planned_qty,
+                        "test_checklist": checklist,
+                    }],
+                    "test_checklist": checklist,
+                    "unit_ids": [unit.id for unit in units],
+                    "serial_numbers": [unit.serial_number for unit in units],
+                },
+            )
+        passed_serials = task.payload.get("preassembly_passed_serial_numbers") or []
+        if not passed_serials:
+            task.status = "hold"
+        task.payload = {
+            **task.payload,
+            "preassembly_test_required": True,
+            "preassembly_test_task_id": existing_pretest.id,
+            "blocked_reason": (
+                None
+                if passed_serials
+                else "Ожидается предварительное тестирование до сборки в корпус"
+            ),
+        }
+    return task
+
+
 def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
                           product_context: dict | None = None) -> WorkflowTask:
     product_context = _normalize_product_context_qty(db, order.id, product_context)
@@ -1421,7 +1622,7 @@ def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
             candidate_payload = candidate.payload or {}
             if not candidate_payload.get("product_context") and len(candidate_payload.get("product_lines") or []) > 1:
                 candidate.status = "done"
-                candidate.completed_at = candidate.completed_at or datetime.utcnow()
+                candidate.completed_at = candidate.completed_at or utcnow()
                 candidate.payload = {
                     **candidate_payload,
                     "replaced_by_product_tasks": True,
@@ -1463,9 +1664,9 @@ def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
             if not materials_complete
             else "Отметить выпуск изделий и передать готовые устройства на тестирование."
         )
-        return task
+        return ensure_assembly_device_pool(db, task)
 
-    return create_task(
+    task = create_task(
         db,
         order_id=order.id,
         task_type="assembler_build",
@@ -1487,6 +1688,7 @@ def _ensure_assembly_task(db: Session, order: Order, materials_complete: bool,
             "component_options": component_options,
         },
     )
+    return ensure_assembly_device_pool(db, task)
 
 
 def normalize_assembly_task_payload(db: Session, task: WorkflowTask) -> dict:
@@ -1612,7 +1814,7 @@ def split_aggregate_assembly_tasks(db: Session):
             for item in payload.get("assembly_devices") or []
         }
         task.status = "done"
-        task.completed_at = task.completed_at or datetime.utcnow()
+        task.completed_at = task.completed_at or utcnow()
         task.payload = {
             **payload,
             "replaced_by_product_tasks": True,
@@ -1754,13 +1956,13 @@ def merge_order_procurement_tasks(db: Session):
             if task.id != keeper.id:
                 notes.append({"task_id": task.id, "title": task.title})
                 task.status = "merged"
-                task.completed_at = datetime.utcnow()
+                task.completed_at = utcnow()
                 task.payload = {**payload, "merged_into_task_id": keeper.id}
 
         keeper.payload = {
             **(keeper.payload or {}),
             "product_context": None,
-            "shortages": _with_shortage_line_uids(merged_shortages),
+            "shortages": _deduplicate_shortage_lines(merged_shortages),
             "purchases": merged_purchases,
             "merged_tasks": [*((keeper.payload or {}).get("merged_tasks") or []), *notes],
         }
@@ -1801,7 +2003,7 @@ def cleanup_premature_assembly_tasks(db: Session):
         if has_receipt:
             continue
         task.status = "cancelled"
-        task.completed_at = datetime.utcnow()
+        task.completed_at = utcnow()
         task.payload = {
             **payload,
             "cancel_reason": "Сборка создается после подтверждения получения комплектующих",
@@ -1884,7 +2086,7 @@ def reconcile_procurement_tasks_with_stock(db: Session):
             task.payload = {**payload, "shortages": _with_shortage_line_uids(remaining_shortages)}
         else:
             task.status = "cancelled"
-            task.completed_at = datetime.utcnow()
+            task.completed_at = utcnow()
             task.payload = {
                 **payload,
                 "shortages": [],
@@ -1956,7 +2158,7 @@ def ensure_procurement_payment_tasks(db: Session):
             )
         if not (payload.get("shortages") or []):
             task.status = "done"
-            task.completed_at = task.completed_at or datetime.utcnow()
+            task.completed_at = task.completed_at or utcnow()
         elif task.status == "waiting_delivery":
             task.status = "in_progress"
             task.completed_at = None
@@ -2038,7 +2240,7 @@ def _receive_finished_goods(db: Session, order_id: int, task: WorkflowTask | Non
 
     payload = task.payload or {}
     completion = payload.get("completion") or {}
-    finished_goods = pending_product_lines(db, task) or payload.get("finished_goods") or []
+    finished_goods = _pending_or_legacy_product_lines(db, task, "finished_goods")
     accepted_lines = [
         line
         for line in completion.get("accepted_goods", [])
@@ -2164,7 +2366,7 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
                 "purchase_group_id": purchase_id,
                 "invoice_attachment": completion_payload.get("invoice_attachment"),
                 "received_qty": 0,
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": utcnow().isoformat(),
             }
             purchases.append(purchase_line)
             accounting_items.append({
@@ -2220,7 +2422,7 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
         return {"status": "partial", "remaining": remaining}
 
     task.status = "done"
-    task.completed_at = datetime.utcnow()
+    task.completed_at = utcnow()
     task.payload = {**task.payload, "completion": completion_payload}
     if order:
         order.status = "Awaiting Components"
@@ -2272,7 +2474,7 @@ def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: 
         "supplier": purchase_payload.get("supplier"),
         "comment": purchase_payload.get("comment"),
         "received_qty": 0,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
     }
 
     task.payload = {
@@ -2330,7 +2532,7 @@ def add_procurement_purchase(db: Session, task: WorkflowTask, purchase_payload: 
         return {"status": "partial", "remaining": remaining, "purchase": purchase}
 
     task.status = "done"
-    task.completed_at = datetime.utcnow()
+    task.completed_at = utcnow()
     order = db.query(Order).filter(Order.id == task.order_id).first() if task.order_id else None
     if order:
         order.status = "Awaiting Components"
@@ -2350,7 +2552,7 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
     _update_procurement_purchase_receipt(db, payload, received)
     ordered_items = payload.get("ordered_items") or [dict(line) for line in incoming]
     receipt_history = [*(payload.get("receipt_history") or []), {
-        "received_at": datetime.utcnow().isoformat(),
+        "received_at": utcnow().isoformat(),
         "items": [
             {
                 "component_id": int(line["component_id"]),
@@ -2374,7 +2576,7 @@ def _complete_warehouse_receive_task(db: Session, task: WorkflowTask, completion
     result_status = "partial" if remaining else "done"
     if not remaining:
         task.status = "done"
-        task.completed_at = datetime.utcnow()
+        task.completed_at = utcnow()
         task.payload = {**task.payload, "completion": completion_payload}
 
     if payload.get("source_task_id"):
@@ -2513,7 +2715,7 @@ def _complete_accounting_payment_task(db: Session, task: WorkflowTask, completio
                         "payment_ref": completion_payload.get("payment_ref") or purchase.get("payment_ref"),
                         "payment_order_attachment": completion_payload.get("payment_order_attachment") or purchase.get("payment_order_attachment"),
                         "payment_comment": completion_payload.get("notes") or purchase.get("payment_comment"),
-                        "paid_at": purchase.get("paid_at") or datetime.utcnow().isoformat(),
+                        "paid_at": purchase.get("paid_at") or utcnow().isoformat(),
                     }
                 purchases.append(purchase)
             procurement_task.payload = {**procurement_payload, "purchases": purchases}
@@ -2588,13 +2790,74 @@ def _complete_assembler_build_task(
     task: WorkflowTask,
     completion_payload: dict,
     order: Order | None,
+    actor_user_id: int | None = None,
 ):
     payload = normalize_task_daily_progress(task)
+    if payload.get("preassembly_test_required") and not payload.get("preassembly_test_completed"):
+        raise HTTPException(
+            status_code=409,
+            detail="Сначала завершите предварительное тестирование устройств до сборки в корпус",
+        )
     product_context = payload.get("product_context")
     target_qty = float(product_context.get("qty") or 0) if product_context else _order_target_qty(db, task.order_id)
     materials_complete = bool(payload.get("materials_complete")) if product_context else _assembly_materials_complete(db, task.order_id)
     save_only = bool(completion_payload.get("save_only"))
-    today = datetime.utcnow().date().isoformat()
+    today = utcnow().date().isoformat()
+    units = (
+        db.query(Item)
+        .filter(Item.assembly_task_id == task.id)
+        .order_by(Item.id.asc())
+        .all()
+    )
+    serial_selection_mode = isinstance(completion_payload.get("assembled_serial_numbers"), list)
+    selected_serials = {
+        str(serial_number)
+        for serial_number in (completion_payload.get("assembled_serial_numbers") or [])
+        if str(serial_number).strip()
+    }
+    if serial_selection_mode:
+        task_serials = {unit.serial_number for unit in units}
+        unknown_serials = selected_serials - task_serials
+        if unknown_serials:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Заводские номера не относятся к этой задаче: {', '.join(sorted(unknown_serials))}",
+            )
+        transferred_serials = set(payload.get("transferred_serial_numbers") or [])
+        if transferred_serials - selected_serials:
+            raise HTTPException(
+                status_code=422,
+                detail="Нельзя снять отметку с устройства, которое уже передано на тестирование",
+            )
+        if "assembly_claims" in payload:
+            assembly_claims = {
+                str(serial_number): int(user_id)
+                for serial_number, user_id in (payload.get("assembly_claims") or {}).items()
+            }
+            newly_assembled_serials = {
+                unit.serial_number
+                for unit in units
+                if unit.serial_number in selected_serials and unit.status in ["planned", "in_assembly"]
+            }
+            foreign_or_unclaimed = [
+                serial_number
+                for serial_number in newly_assembled_serials
+                if assembly_claims.get(serial_number) != actor_user_id
+            ]
+            if foreign_or_unclaimed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Можно отмечать собранными только устройства, закреплённые за вами",
+                )
+            payload = {
+                **payload,
+                "assembly_claims": {
+                    serial_number: user_id
+                    for serial_number, user_id in assembly_claims.items()
+                    if serial_number not in newly_assembled_serials
+                },
+            }
+            task.payload = payload
 
     assignments = _default_assembly_assignments(task, payload, target_qty)
     if completion_payload.get("assembly_assignments"):
@@ -2608,7 +2871,7 @@ def _complete_assembler_build_task(
 
     daily_entries = []
     legacy_daily_qty = completion_payload.get("daily_qty")
-    if legacy_daily_qty not in [None, ""]:
+    if not serial_selection_mode and legacy_daily_qty not in [None, ""]:
         daily_entries.append({
             "assignment_id": assignments[0]["id"] if assignments else str(uuid.uuid4()),
             "user_id": task.assigned_user_id,
@@ -2616,7 +2879,8 @@ def _complete_assembler_build_task(
             "comment": completion_payload.get("daily_comment"),
             "transfer_from_user_id": completion_payload.get("transfer_from_user_id"),
         })
-    daily_entries.extend(completion_payload.get("daily_entries") or [])
+    if not serial_selection_mode:
+        daily_entries.extend(completion_payload.get("daily_entries") or [])
 
     daily_progress = list(payload.get("daily_progress") or [])
     assignment_by_id = {item["id"]: item for item in assignments if item.get("id")}
@@ -2653,7 +2917,18 @@ def _complete_assembler_build_task(
         saved_entries.append(saved_entry)
         daily_progress.append(saved_entry)
 
-    assembled_qty = float(completion_payload.get("assembled_qty") or 0)
+    if serial_selection_mode and assignments:
+        if len(assignments) == 1:
+            assignments[0]["produced_qty"] = float(len(selected_serials))
+        else:
+            produced_by_user = {}
+            for unit in units:
+                if unit.serial_number in selected_serials and unit.assigned_user_id:
+                    produced_by_user[unit.assigned_user_id] = produced_by_user.get(unit.assigned_user_id, 0) + 1
+            for assignment in assignments:
+                assignment["produced_qty"] = float(produced_by_user.get(assignment.get("user_id"), 0))
+
+    assembled_qty = float(len(selected_serials)) if serial_selection_mode else float(completion_payload.get("assembled_qty") or 0)
     produced_total = sum(float(item.get("produced_qty") or 0) for item in assignments)
     if assembled_qty <= 0:
         assembled_qty = produced_total
@@ -2727,6 +3002,20 @@ def _complete_assembler_build_task(
         "daily_progress": daily_progress,
         "completion": stored_completion,
     }
+    assembled_units_count = min(int(produced_total), len(units))
+    for index, unit in enumerate(units):
+        should_be_assembled = unit.serial_number in selected_serials if serial_selection_mode else index < assembled_units_count
+        if should_be_assembled:
+            if unit.status in ["planned", "in_assembly", "assembled"]:
+                unit.status = "assembled"
+                unit.assembly_started_at = unit.assembly_started_at or utcnow()
+                unit.assembled_at = unit.assembled_at or utcnow()
+        elif serial_selection_mode and unit.status == "assembled":
+            unit.status = "in_assembly"
+            unit.assembled_at = None
+        elif produced_total > 0 and unit.status == "planned":
+            unit.status = "in_assembly"
+            unit.assembly_started_at = unit.assembly_started_at or utcnow()
     if order:
         order.status = "In Assembly"
 
@@ -2783,11 +3072,16 @@ def _complete_assembler_build_task(
     assembly_finished = materials_complete and assembled_qty >= target_qty
     task.payload = {**task.payload, "transferred_to_test_qty": assembled_qty}
     task.status = "done" if assembly_finished else "in_progress"
-    task.completed_at = datetime.utcnow() if assembly_finished else None
+    task.completed_at = utcnow() if assembly_finished else None
     if order:
         order.status = "Quality Check" if assembly_finished else "In Assembly"
     context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
     product_lines_for_test = []
+    units_for_test = [
+        unit for unit in units
+        if unit.status == "assembled"
+        and unit.serial_number not in set(payload.get("transferred_serial_numbers") or [])
+    ][:int(transfer_qty)]
     for key, line in lines_by_key.items():
         qty = produced_by_device.get(key, 0)
         if qty <= 0 and product_context:
@@ -2811,6 +3105,16 @@ def _complete_assembler_build_task(
             for line in product_lines
         ]
     task_checklist = product_lines_for_test[0].get("test_checklist") if len(product_lines_for_test) == 1 else []
+    transferred_serial_numbers = [unit.serial_number for unit in units_for_test]
+    for unit in units_for_test:
+        unit.status = "testing"
+    task.payload = {
+        **task.payload,
+        "transferred_serial_numbers": [
+            *(payload.get("transferred_serial_numbers") or []),
+            *transferred_serial_numbers,
+        ],
+    }
     create_task(
         db,
         order_id=task.order_id,
@@ -2821,10 +3125,14 @@ def _complete_assembler_build_task(
         payload={
             **({"product_context": product_context} if product_context else {}),
             "source_assembly_task_id": task.id,
+            "pre_assembly": False,
+            "retest": False,
             "assembled_qty": assembled_qty,
             "planned_qty": target_qty,
             "product_lines": product_lines_for_test,
             "test_checklist": task_checklist,
+            "unit_ids": [unit.id for unit in units_for_test],
+            "serial_numbers": transferred_serial_numbers,
         },
     )
     return {
@@ -2852,11 +3160,11 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
     elif task.type == "accounting_payment":
         task.payload = {**payload, "completion": completion_payload}
         task.status = "done"
-        task.completed_at = datetime.utcnow()
+        task.completed_at = utcnow()
         return _complete_accounting_payment_task(db, task, completion_payload, order)
 
     elif task.type == "assembler_build":
-        return _complete_assembler_build_task(db, task, completion_payload, order)
+        return _complete_assembler_build_task(db, task, completion_payload, order, actor_user_id)
 
     if task.type == "warehouse_issue_materials":
         task.payload = {**payload, "completion": completion_payload}
@@ -2904,7 +3212,7 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
 
     task.payload = {**payload, "completion": completion_payload}
     task.status = "done"
-    task.completed_at = datetime.utcnow()
+    task.completed_at = utcnow()
 
     if task.type == "assembler_receive_materials":
         _accept_material_transfer(db, task, actor_user_id)
@@ -2927,7 +3235,7 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
             ).first()
             if issue_task:
                 issue_task.status = "done"
-                issue_task.completed_at = datetime.utcnow()
+                issue_task.completed_at = utcnow()
         product_context = payload.get("product_context")
         if product_context:
             materials_complete = not bool(payload.get("partial"))
@@ -3043,16 +3351,119 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
             ).first()
             if issue_task:
                 issue_task.status = "done"
-                issue_task.completed_at = datetime.utcnow()
+                issue_task.completed_at = utcnow()
         if order:
             order.status = "Repair Required"
 
     elif task.type == "tester_check":
         product_context = payload.get("product_context")
-        product_lines = pending_product_lines(db, task) or (
-            payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        product_lines = _pending_or_legacy_product_lines(
+            db, task, "product_lines", aggregate_all=True
         )
+        if not product_lines and batch_summary(db, task)["batches_total"] == 0:
+            product_lines = _order_product_lines(db, task.order_id)
         test_total_qty = sum(float(item.get("qty") or 0) for item in product_lines)
+        available_units = (
+            db.query(Item)
+            .filter(
+                Item.id.in_(payload.get("unit_ids") or [-1]),
+                Item.status == "testing",
+            )
+            .order_by(Item.id.asc())
+            .all()
+        )
+        serial_test_results = completion_payload.get("serial_test_results")
+        results_by_serial = {}
+        if available_units and not isinstance(serial_test_results, list):
+            raise HTTPException(
+                status_code=422,
+                detail="Проверьте каждое изделие по заводскому номеру",
+            )
+        if isinstance(serial_test_results, list):
+            results_by_serial = {
+                str(item.get("serial_number")): item
+                for item in serial_test_results
+                if item.get("serial_number") and item.get("reviewed")
+            }
+            available_serials = {unit.serial_number for unit in available_units}
+            if not results_by_serial:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Зафиксируйте результат хотя бы одного устройства",
+                )
+            if set(results_by_serial) - available_serials:
+                raise HTTPException(
+                    status_code=422,
+                    detail="В результатах есть заводской номер, которого нет в текущей партии",
+                )
+            if "testing_claims" in payload:
+                testing_claims = {
+                    str(serial_number): int(user_id)
+                    for serial_number, user_id in (payload.get("testing_claims") or {}).items()
+                }
+                foreign_or_unclaimed = [
+                    serial_number
+                    for serial_number in results_by_serial
+                    if testing_claims.get(serial_number) != actor_user_id
+                ]
+                if foreign_or_unclaimed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Можно сохранять результаты только по устройствам, закреплённым за вами",
+                    )
+                task.payload = {
+                    **(task.payload or {}),
+                    "testing_claims": {
+                        serial_number: user_id
+                        for serial_number, user_id in testing_claims.items()
+                        if serial_number not in results_by_serial
+                    },
+                }
+                payload = task.payload
+            available_units = [
+                unit for unit in available_units
+                if unit.serial_number in results_by_serial
+            ]
+            defective_serials_from_checklists = {
+                serial_number
+                for serial_number, result in results_by_serial.items()
+                if any(not bool(item.get("checked")) for item in (result.get("checklist") or []))
+            }
+            product_metadata = {
+                int(line["product_id"]): line
+                for line in product_lines
+                if line.get("product_id")
+            }
+            selected_by_product = {}
+            defective_by_product = {}
+            for unit in available_units:
+                product_id = int(unit.product_id or (product_context or {}).get("product_id"))
+                selected_by_product[product_id] = selected_by_product.get(product_id, 0) + 1
+                if unit.serial_number in defective_serials_from_checklists:
+                    defective_by_product[product_id] = defective_by_product.get(product_id, 0) + 1
+            product_lines = [
+                {
+                    **product_metadata.get(product_id, {"product_id": product_id}),
+                    "qty": quantity,
+                }
+                for product_id, quantity in selected_by_product.items()
+            ]
+            test_total_qty = len(available_units)
+            defective_products_from_checklists = [
+                {
+                    **product_metadata.get(product_id, {"product_id": product_id}),
+                    "defective_qty": quantity,
+                }
+                for product_id, quantity in defective_by_product.items()
+            ]
+            completion_payload = {
+                **completion_payload,
+                "serial_test_results": list(results_by_serial.values()),
+                "defective_serial_numbers": sorted(defective_serials_from_checklists),
+                "defective_qty": len(defective_serials_from_checklists),
+                "passed_qty": len(available_units) - len(defective_serials_from_checklists),
+                "defective_products": defective_products_from_checklists,
+            }
         defective_products = [
             {
                 "product_id": int(item["product_id"]),
@@ -3076,12 +3487,74 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                 detail=f"Тестирование должно закрыть ровно {test_total_qty:g} шт.: указано {tested_qty:g} шт.",
             )
         checklist = completion_payload.get("test_checklist") or payload.get("test_checklist") or []
-        if checklist and any(not item.get("checked") for item in checklist):
+        if not isinstance(serial_test_results, list) and checklist and any(not item.get("checked") for item in checklist):
             raise HTTPException(status_code=400, detail="Нельзя закрыть тестирование: чеклист проверки заполнен не полностью")
+        requested_defective_serials = set(completion_payload.get("defective_serial_numbers") or [])
+        available_serials = {unit.serial_number for unit in available_units}
+        if requested_defective_serials - available_serials:
+            raise HTTPException(status_code=422, detail="Выбран заводской номер, которого нет в текущей партии тестирования")
+        if requested_defective_serials and len(requested_defective_serials) != int(defective_qty):
+            raise HTTPException(status_code=422, detail="Количество отмеченных заводских номеров с браком не совпадает с количеством брака")
+        if not requested_defective_serials and defective_qty > 0:
+            requested_defective_serials = {unit.serial_number for unit in available_units[:int(defective_qty)]}
+        passed_units = []
+        defective_units = []
+        for unit in available_units:
+            unit.tested_at = utcnow()
+            if unit.serial_number in requested_defective_serials:
+                unit.status = "repair"
+                unit.test_result = "defective"
+                unit.defect_note = completion_payload.get("notes")
+                defective_units.append(unit)
+            else:
+                unit.status = "passed"
+                unit.test_result = "passed"
+                passed_units.append(unit)
+        pre_assembly_test = bool(payload.get("pre_assembly"))
+        source_assembly_task = None
+        if pre_assembly_test and payload.get("source_assembly_task_id"):
+            source_assembly_task = db.query(WorkflowTask).filter(
+                WorkflowTask.id == int(payload["source_assembly_task_id"]),
+                WorkflowTask.type == "assembler_build",
+            ).first()
+        if source_assembly_task and passed_units:
+            source_payload = source_assembly_task.payload or {}
+            passed_serials = {
+                *(source_payload.get("preassembly_passed_serial_numbers") or []),
+                *[unit.serial_number for unit in passed_units],
+            }
+            for unit in passed_units:
+                unit.status = "planned"
+                unit.assigned_user_id = None
+            source_assembly_task.payload = {
+                **source_payload,
+                "preassembly_passed_serial_numbers": sorted(passed_serials),
+                "blocked_reason": None,
+            }
+            source_assembly_task.status = "assigned"
+            source_assembly_task.completed_at = None
+            if order:
+                order.status = "In Assembly"
         if defective_qty > 0:
             if order:
                 order.status = "Repair Required"
             defective_product_ids = [item["product_id"] for item in defective_products]
+            serial_defects = [
+                {
+                    "serial_number": unit.serial_number,
+                    "product_id": unit.product_id,
+                    "failed_checks": [
+                        {
+                            "id": item.get("id"),
+                            "label": item.get("label") or str(item.get("id") or "Неисправность"),
+                        }
+                        for item in (results_by_serial.get(unit.serial_number, {}).get("checklist") or [])
+                        if not bool(item.get("checked"))
+                    ],
+                    "tester_note": completion_payload.get("notes") or "",
+                }
+                for unit in defective_units
+            ]
             context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
             defective_by_product = {
                 int(item["product_id"]): int(item.get("defective_qty") or 0)
@@ -3099,7 +3572,7 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                 line_passed = max(line_qty - line_defective, 0)
                 if line_passed > 0:
                     passed_product_lines.append({**line, "qty": line_passed})
-            if passed_product_lines:
+            if passed_product_lines and not pre_assembly_test:
                 create_task(
                     db,
                     order_id=task.order_id,
@@ -3111,6 +3584,8 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                         **({"product_context": product_context} if product_context else {}),
                         "source_test_task_id": task.id,
                         "product_lines": passed_product_lines,
+                        "unit_ids": [unit.id for unit in passed_units],
+                        "serial_numbers": [unit.serial_number for unit in passed_units],
                     },
                 )
             create_task(
@@ -3119,16 +3594,22 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                 task_type="repair_defects",
                 title=f"Устранить брак по заказу #{task.order_id}{context_label}",
                 role="repair_engineer",
-                description="Устранить выявленные дефекты и передать изделия на упаковку.",
+                description="Устранить выявленные дефекты и передать изделия на повторное тестирование.",
                 payload={
                     **({"product_context": product_context} if product_context else {}),
+                    "source_test_task_id": task.id,
+                    "source_assembly_task_id": payload.get("source_assembly_task_id"),
+                    "pre_assembly": pre_assembly_test,
                     "defective_qty": defective_qty,
                     "defective_products": defective_products,
                     "notes": completion_payload.get("notes"),
                     "component_options": _order_bom_component_options(db, task.order_id, product_ids=defective_product_ids or None),
+                    "unit_ids": [unit.id for unit in defective_units],
+                    "serial_numbers": [unit.serial_number for unit in defective_units],
+                    "serial_defects": serial_defects,
                 },
             )
-        else:
+        elif not pre_assembly_test:
             if order:
                 order.status = "Ready For Packing"
             context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
@@ -3142,18 +3623,36 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                 payload={
                     **({"product_context": product_context} if product_context else {}),
                     "product_lines": product_lines,
+                    "unit_ids": [unit.id for unit in passed_units],
+                    "serial_numbers": [unit.serial_number for unit in passed_units],
                 },
             )
+        elif source_assembly_task:
+            all_source_units = db.query(Item).filter(
+                Item.assembly_task_id == source_assembly_task.id,
+            ).all()
+            if all(unit.status not in ["testing", "repair"] for unit in all_source_units):
+                source_assembly_task.payload = {
+                    **(source_assembly_task.payload or {}),
+                    "preassembly_test_completed": True,
+                    "blocked_reason": None,
+                }
         consume_workflow_batches(db, task, tested_qty)
-        upstream_open = (
+        upstream_open = False if pre_assembly_test else (
             _active_primary_testing_exists(db, task.order_id, exclude_task_id=task.id)
             if payload.get("retest")
-            else _active_stage_exists(db, task.order_id, ["assembler_build"], exclude_task_id=task.id)
+            else _active_stage_exists_for_context(
+                db,
+                task.order_id,
+                ["assembler_build"],
+                product_context,
+                exclude_task_id=task.id,
+            )
         )
         remaining = batch_summary(db, task)["pending_qty"]
         if upstream_open or remaining > 0:
             history = list(payload.get("completion_history") or [])
-            history.append({**completion_payload, "processed_qty": tested_qty, "completed_at": datetime.utcnow().isoformat()})
+            history.append({**completion_payload, "processed_qty": tested_qty, "completed_at": utcnow().isoformat()})
             task.payload = {**task.payload, "completion": {}, "completion_history": history}
             task.status = "assigned"
             task.completed_at = None
@@ -3183,24 +3682,93 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
         product_context = payload.get("product_context")
         context_label = f" · {product_context.get('product_name')}" if product_context and product_context.get("product_name") else ""
         repair_pending_lines = pending_product_lines(db, task)
-        repaired_product_lines = [
-            {
-                "product_id": item.get("product_id"),
-                "product_name": item.get("product_name"),
-                "drawing_number": item.get("drawing_number"),
-                "qty": int(item.get("qty") or item.get("defective_qty") or 0),
-                "test_checklist": _product_test_checklist(db, item.get("product_id")),
+        repaired_units = (
+            db.query(Item)
+            .filter(
+                Item.id.in_(payload.get("unit_ids") or [-1]),
+                Item.status == "repair",
+            )
+            .order_by(Item.id.asc())
+            .all()
+        )
+        repair_results = completion_payload.get("serial_repair_results")
+        if repaired_units:
+            if not isinstance(repair_results, list):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Опишите выполненный ремонт для каждого заводского номера",
+                )
+            repair_results_by_serial = {
+                str(item.get("serial_number")): item
+                for item in repair_results
+                if item.get("serial_number") and str(item.get("work_done") or "").strip()
             }
-            for item in (repair_pending_lines or payload.get("defective_products") or [])
-            if item.get("product_id") and int(item.get("qty") or item.get("defective_qty") or 0) > 0
-        ] or [
-            {
-                **item,
-                "test_checklist": _product_test_checklist(db, item.get("product_id")),
+            repaired_serials = {unit.serial_number for unit in repaired_units}
+            if set(repair_results_by_serial) != repaired_serials:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Для каждого ремонтируемого устройства нужно указать, что было сделано",
+                )
+            repair_results = [
+                {
+                    **repair_results_by_serial[unit.serial_number],
+                    "work_done": str(repair_results_by_serial[unit.serial_number]["work_done"]).strip(),
+                }
+                for unit in repaired_units
+            ]
+            for unit in repaired_units:
+                unit.defect_note = repair_results_by_serial[unit.serial_number]["work_done"].strip()
+            completion_payload = {
+                **completion_payload,
+                "serial_repair_results": repair_results,
             }
-            for item in (payload.get("product_lines") or _order_product_lines(db, task.order_id))
-        ]
+        else:
+            repair_results = []
+        if repaired_units:
+            product_metadata = {
+                int(item["product_id"]): item
+                for item in (
+                    repair_pending_lines
+                    or payload.get("defective_products")
+                    or payload.get("product_lines")
+                    or [product_context]
+                )
+                if item and item.get("product_id")
+            }
+            repaired_by_product = {}
+            for unit in repaired_units:
+                product_id = int(unit.product_id or (product_context or {}).get("product_id"))
+                repaired_by_product[product_id] = repaired_by_product.get(product_id, 0) + 1
+            repaired_product_lines = [
+                {
+                    **product_metadata.get(product_id, {"product_id": product_id}),
+                    "qty": quantity,
+                    "test_checklist": _product_test_checklist(db, product_id),
+                }
+                for product_id, quantity in repaired_by_product.items()
+            ]
+        else:
+            repaired_product_lines = [
+                {
+                    "product_id": item.get("product_id"),
+                    "product_name": item.get("product_name"),
+                    "drawing_number": item.get("drawing_number"),
+                    "qty": int(item.get("qty") or item.get("defective_qty") or 0),
+                    "test_checklist": _product_test_checklist(db, item.get("product_id")),
+                }
+                for item in (repair_pending_lines or payload.get("defective_products") or [])
+                if item.get("product_id") and int(item.get("qty") or item.get("defective_qty") or 0) > 0
+            ] or [
+                {
+                    **item,
+                    "test_checklist": _product_test_checklist(db, item.get("product_id")),
+                }
+                for item in (payload.get("product_lines") or _order_product_lines(db, task.order_id))
+            ]
         task_checklist = repaired_product_lines[0].get("test_checklist") if len(repaired_product_lines) == 1 else []
+        for unit in repaired_units:
+            unit.status = "testing"
+            unit.test_result = None
         if order:
             order.status = "Quality Check"
         create_task(
@@ -3214,36 +3782,87 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
                 **({"product_context": product_context} if product_context else {}),
                 "source_repair_task_id": task.id,
                 "retest": True,
+                "source_assembly_task_id": payload.get("source_assembly_task_id"),
+                "pre_assembly": bool(payload.get("pre_assembly")),
                 "repair_notes": completion_payload.get("notes"),
+                "repair_results": repair_results,
                 "product_lines": repaired_product_lines,
                 "test_checklist": task_checklist,
+                "unit_ids": [unit.id for unit in repaired_units],
+                "serial_numbers": [unit.serial_number for unit in repaired_units],
             },
         )
         repaired_qty = sum(float(line.get("qty") or 0) for line in repaired_product_lines)
         consume_workflow_batches(db, task, repaired_qty)
         if batch_summary(db, task)["pending_qty"] > 0:
             history = list(payload.get("completion_history") or [])
-            history.append({**completion_payload, "processed_qty": repaired_qty, "completed_at": datetime.utcnow().isoformat()})
+            history.append({**completion_payload, "processed_qty": repaired_qty, "completed_at": utcnow().isoformat()})
             task.payload = {**task.payload, "completion": {}, "completion_history": history}
             task.status = "assigned"
             task.completed_at = None
 
     elif task.type == "packer_pack":
-        product_lines = pending_product_lines(db, task) or (
-            payload.get("product_lines") or _order_product_lines(db, task.order_id)
+        product_lines = _pending_or_legacy_product_lines(
+            db,
+            task,
+            "product_lines",
+            aggregate_all=True,
         )
+        if not product_lines and batch_summary(db, task)["batches_total"] == 0:
+            product_lines = _order_product_lines(db, task.order_id)
         available_qty = sum(float(item.get("qty") or 0) for item in product_lines)
-        packed_qty = float(completion_payload.get("packed_qty") or 0)
+        serial_selection_mode = isinstance(completion_payload.get("packed_serial_numbers"), list)
+        selected_serials = {
+            str(serial_number)
+            for serial_number in (completion_payload.get("packed_serial_numbers") or [])
+            if str(serial_number).strip()
+        }
+        available_units = (
+            db.query(Item)
+            .filter(
+                Item.id.in_(payload.get("unit_ids") or [-1]),
+                Item.status == "passed",
+            )
+            .order_by(Item.id.asc())
+            .all()
+        )
+        if serial_selection_mode:
+            available_serials = {unit.serial_number for unit in available_units}
+            unknown_serials = selected_serials - available_serials
+            if unknown_serials:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Нельзя упаковать недоступные устройства: {', '.join(sorted(unknown_serials))}",
+                )
+            packed_units = [unit for unit in available_units if unit.serial_number in selected_serials]
+            packed_qty = float(len(packed_units))
+        else:
+            packed_qty = float(completion_payload.get("packed_qty") or 0)
+            packed_units = available_units[:int(packed_qty)]
         if available_qty <= 0:
             raise HTTPException(status_code=400, detail="В задаче упаковки нет изделий для упаковки")
         if packed_qty <= 0:
-            raise HTTPException(status_code=400, detail="Укажите количество упакованных изделий")
+            raise HTTPException(status_code=400, detail="Отметьте хотя бы одно упакованное устройство")
         if packed_qty > available_qty:
             raise HTTPException(
                 status_code=400,
                 detail=f"Нельзя упаковать {packed_qty:g} шт.: доступно {available_qty:g} шт.",
             )
-        product_lines = _take_product_quantity(product_lines, packed_qty)
+        packed_by_product = {}
+        for unit in packed_units:
+            packed_by_product[unit.product_id] = packed_by_product.get(unit.product_id, 0) + 1
+        selected_product_lines = []
+        for line in product_lines:
+            product_id = line.get("product_id")
+            line_qty = min(float(line.get("qty") or 0), float(packed_by_product.get(product_id, 0)))
+            if line_qty <= 0:
+                continue
+            selected_product_lines.append({**line, "qty": line_qty})
+            packed_by_product[product_id] -= line_qty
+        product_lines = selected_product_lines or _take_product_quantity(product_lines, packed_qty)
+        for unit in packed_units:
+            unit.status = "packed"
+            unit.packed_at = utcnow()
         if order:
             order.status = "Finished Goods"
         product_context = payload.get("product_context")
@@ -3258,30 +3877,93 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
             payload={
                 **({"product_context": product_context} if product_context else {}),
                 "source_pack_task_id": task.id,
-                "packed_qty": completion_payload.get("packed_qty"),
+                "packed_qty": packed_qty,
                 "finished_goods": product_lines,
+                "unit_ids": [unit.id for unit in packed_units],
+                "serial_numbers": [unit.serial_number for unit in packed_units],
             },
         )
         consume_workflow_batches(db, task, packed_qty)
         remaining = batch_summary(db, task)["pending_qty"]
-        if remaining > 0 or _active_stage_exists(
-            db, task.order_id, ["tester_check", "repair_defects"], exclude_task_id=task.id
+        if remaining > 0 or _active_stage_exists_for_context(
+            db,
+            task.order_id,
+            ["tester_check", "repair_defects"],
+            product_context,
+            exclude_task_id=task.id,
         ):
             history = list(payload.get("completion_history") or [])
-            history.append({**completion_payload, "processed_qty": packed_qty, "completed_at": datetime.utcnow().isoformat()})
+            history.append({**completion_payload, "processed_qty": packed_qty, "completed_at": utcnow().isoformat()})
             task.payload = {**task.payload, "completion": {}, "completion_history": history}
             task.status = "assigned"
             task.completed_at = None
 
     elif task.type == "warehouse_finished_goods":
+        accepted_by_product = {}
+        for line in completion_payload.get("accepted_goods") or []:
+            if not line.get("product_id"):
+                continue
+            product_id = int(line["product_id"])
+            accepted_by_product[product_id] = (
+                accepted_by_product.get(product_id, 0)
+                + float(line.get("qty") or 0)
+            )
+        tracked_unit_ids = payload.get("unit_ids") or []
+        available_units = (
+            db.query(Item)
+            .filter(
+                Item.id.in_(tracked_unit_ids or [-1]),
+                Item.status == "packed",
+            )
+            .order_by(Item.id.asc())
+            .all()
+        )
+        available_by_product = {}
+        for unit in available_units:
+            available_by_product[unit.product_id] = available_by_product.get(unit.product_id, 0) + 1
+        if tracked_unit_ids:
+            for product_id, accepted_qty in accepted_by_product.items():
+                available_qty = available_by_product.get(product_id, 0)
+                if accepted_qty > available_qty:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Нельзя принять {accepted_qty:g} шт.: "
+                            f"к оприходованию доступно {available_qty:g} шт."
+                        ),
+                    )
+            if not available_units:
+                raise HTTPException(status_code=400, detail="Эта партия уже оприходована")
+
         _receive_finished_goods(db, task.order_id, task, actor_user_id)
-        accepted_qty = sum(float(line.get("qty") or 0) for line in completion_payload.get("accepted_goods") or [])
+        stocked_units = []
+        remaining_by_product = dict(accepted_by_product)
+        for unit in available_units:
+            if remaining_by_product.get(unit.product_id, 0) <= 0:
+                continue
+            stocked_units.append(unit)
+            remaining_by_product[unit.product_id] -= 1
+        accepted_qty = (
+            float(len(stocked_units))
+            if tracked_unit_ids
+            else sum(accepted_by_product.values())
+        )
+        for unit in stocked_units:
+            unit.status = "stocked"
+            unit.stocked_at = utcnow()
         consume_workflow_batches(db, task, accepted_qty)
         db.flush()
         remaining = batch_summary(db, task)["pending_qty"]
-        if remaining > 0 or _active_stage_exists(db, task.order_id, ["packer_pack"], exclude_task_id=task.id):
+        product_context = payload.get("product_context")
+        if remaining > 0 or _active_stage_exists_for_context(
+            db,
+            task.order_id,
+            ["packer_pack"],
+            product_context,
+            exclude_task_id=task.id,
+        ):
             history = list(payload.get("completion_history") or [])
-            history.append({**completion_payload, "processed_qty": accepted_qty, "completed_at": datetime.utcnow().isoformat()})
+            history.append({**completion_payload, "processed_qty": accepted_qty, "completed_at": utcnow().isoformat()})
             task.payload = {**task.payload, "completion": {}, "completion_history": history}
             task.status = "assigned"
             task.completed_at = None
@@ -3315,7 +3997,23 @@ def complete_task(db: Session, task: WorkflowTask, completion_payload: dict | No
         ~WorkflowTask.id.in_(existing_ids) if existing_ids else WorkflowTask.id.isnot(None),
     ).all()
     for new_task in new_tasks:
-        validate_transition(task.type, new_task.type)
+        new_payload = new_task.payload or {}
+        explicit_source_id = next((
+            new_payload.get(key)
+            for key in (
+                "source_test_task_id",
+                "source_repair_task_id",
+                "source_issue_task_id",
+                "source_pack_task_id",
+                "source_assembly_task_id",
+            )
+            if new_payload.get(key)
+        ), None)
+        transition_source = (
+            db.query(WorkflowTask).filter(WorkflowTask.id == int(explicit_source_id)).first()
+            if explicit_source_id else None
+        ) or task
+        validate_transition(transition_source.type, new_task.type)
         sync_task_quantities(db, new_task)
     sync_task_quantities(db, task)
     record_completion_batch(db, task, completion_payload)

@@ -14,6 +14,7 @@ VALID_ROLES = [
     "repair_engineer",
     "packer",
     "production",
+    "production_manager",
 ]
 
 

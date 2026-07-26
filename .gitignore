@@ -1,20 +1,45 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
+*.so
+.Python
+.venv/
 venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Environment and secrets
 .env
+.env.*
+!.env.example
 
-# PyCharm
-.idea/
-
-# App
-storage/
+# Runtime data
 *.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite3
+*.bak
+*.dump
+*.tar.gz
+backups/
+storage/
+uploads/
 
-#docs
-docs/GIT_GUIDE.md
-/sql_app.db.before_inventory_import_20260720_1533.bak
-/scripts/import_inventory_xlsx.py
-/sql_app.db.before_part_number_names_20260720.bak
-/sql_app.db.before_specifications_cleanup_20260720.bak
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

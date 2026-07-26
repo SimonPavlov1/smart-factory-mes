@@ -47,6 +47,12 @@ class ProductType(Base):
     photo_url = Column(String, nullable=True, comment="Фото или рендер изделия для карточки")
     attachments = Column(JSON, default=list, comment="Файлы КД, сборочные чертежи, составы и прочая документация")
     test_checklist = Column(JSON, default=list, comment="Пункты проверки изделия для задач тестирования")
+    requires_preassembly_test = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+        comment="Требуется проверка устройства до финальной сборки в корпус",
+    )
     description = Column(Text, nullable=True, comment="Технические особенности или нюансы сборки.")
 
     # Связи
@@ -138,6 +144,15 @@ class Order(Base):
                     comment="Этап: In Progress -> In Production -> Completed.")
     created_at = Column(DateTime, server_default=func.now(), comment="Время постановки в очередь.")
     planned_delivery_date = Column(DateTime, nullable=True, comment="Плановая дата поставки заказчику")
+    cancellation_status = Column(String, nullable=True, index=True)
+    cancellation_reason = Column(Text, nullable=True)
+    cancellation_requested_at = Column(DateTime, nullable=True)
+    cancellation_requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    cancellation_approved_at = Column(DateTime, nullable=True)
+    cancellation_approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    financial_impact = Column(Float, nullable=False, default=0)
+    cancellation_summary = Column(JSON, nullable=True)
 
     # Связи
     # lazy="joined" автоматически подгружает список позиций при базовом запросе к заказу
@@ -186,10 +201,32 @@ class Item(Base):
     __tablename__ = "items"
     id = Column(Integer, primary_key=True)
     order_id = Column(Integer, ForeignKey("orders.id"), index=True, nullable=False)
+    order_item_id = Column(Integer, ForeignKey("order_items.id"), index=True, nullable=True)
+    product_id = Column(Integer, ForeignKey("product_types.id"), index=True, nullable=True)
+    assembly_task_id = Column(Integer, ForeignKey("workflow_tasks.id"), index=True, nullable=True)
+    assigned_user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     serial_number = Column(String, unique=True, index=True, nullable=False, comment="SN изделия.")
+    status = Column(String, nullable=False, default="planned", index=True)
     test_result = Column(String, nullable=True, comment="Результат прохождения ОТК.")
+    defect_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    assembly_started_at = Column(DateTime, nullable=True)
+    assembled_at = Column(DateTime, nullable=True)
+    tested_at = Column(DateTime, nullable=True)
+    packed_at = Column(DateTime, nullable=True)
+    stocked_at = Column(DateTime, nullable=True)
 
     order = relationship("Order", back_populates="items_sn")
+
+
+class FactoryNumberSequence(Base):
+    __tablename__ = "factory_number_sequences"
+    __table_args__ = (UniqueConstraint("prefix", "year", name="uq_factory_number_prefix_year"),)
+
+    id = Column(Integer, primary_key=True)
+    prefix = Column(String, nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    last_value = Column(Integer, nullable=False, default=0)
 
 
 class WorkflowTask(Base):
@@ -201,18 +238,103 @@ class WorkflowTask(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey("orders.id"), index=True, nullable=True)
+    product_id = Column(Integer, ForeignKey("product_types.id"), index=True, nullable=True)
     type = Column(String, index=True, nullable=False)
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     role = Column(String, index=True, nullable=False)
     status = Column(String, default="assigned", index=True, nullable=False)
     assigned_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    is_manual = Column(Boolean, nullable=False, default=False, index=True)
+    priority = Column(String, nullable=False, default="normal", index=True)
     payload = Column(JSON, nullable=True)
     sort_order = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     due_date = Column(DateTime, nullable=True)
+    planned_start_at = Column(DateTime, nullable=True)
+    estimated_minutes = Column(Integer, nullable=True)
+    actual_minutes = Column(Integer, nullable=True)
+    sla_due_at = Column(DateTime, nullable=True, index=True)
+    deadline_change_reason = Column(Text, nullable=True)
+    hold_reason = Column(Text, nullable=True)
+    cancel_reason = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=True)
+
+
+class TaskEvent(Base):
+    """Неизменяемый журнал действий над задачей."""
+    __tablename__ = "task_events"
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    from_status = Column(String, nullable=True)
+    to_status = Column(String, nullable=True)
+    reason = Column(Text, nullable=True)
+    data = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False, index=True)
+
+
+class TaskWatcher(Base):
+    """Наблюдатель задачи, получающий внутренние уведомления."""
+    __tablename__ = "task_watchers"
+    __table_args__ = (UniqueConstraint("task_id", "user_id", name="uq_task_watcher"),)
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskDependency(Base):
+    """Направленная связь между задачами."""
+    __tablename__ = "task_dependencies"
+    __table_args__ = (
+        UniqueConstraint("task_id", "depends_on_task_id", "dependency_type", name="uq_task_dependency"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    depends_on_task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    dependency_type = Column(String, nullable=False, default="blocks", index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class TaskNotification(Base):
+    """Внутреннее уведомление по событию задачи."""
+    __tablename__ = "task_notifications"
+    __table_args__ = (UniqueConstraint("event_id", "user_id", name="uq_task_notification_event_user"),)
+
+    id = Column(Integer, primary_key=True)
+    event_id = Column(Integer, ForeignKey("task_events.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    read_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class OrderCancellationObligation(Base):
+    """Обязательство, которое нужно закрыть перед окончательной отменой заказа."""
+    __tablename__ = "order_cancellation_obligations"
+
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    obligation_type = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="open", index=True)
+    responsible_role = Column(String, nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("workflow_tasks.id"), nullable=True, index=True)
+    description = Column(Text, nullable=False)
+    resolution = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
 class MaterialTransfer(Base):

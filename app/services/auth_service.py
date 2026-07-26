@@ -31,6 +31,11 @@ ROLE_PERMISSIONS = {
     "repair_engineer": ["production:read", "manufacturing:read", "quality:repair"],
     "packer": ["manufacturing:read", "shipping:pack"],
     "production": ["production:read", "manufacturing:read", "manufacturing:write"],
+    "production_manager": [
+        "inventory:read", "production:read", "production:write",
+        "manufacturing:read", "manufacturing:write", "tasks:manage",
+        "orders:cancel",
+    ],
 }
 
 

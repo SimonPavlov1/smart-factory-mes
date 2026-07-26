@@ -21,13 +21,13 @@ from app.services.workflow_service import (
 
 class MaterialTransferWorkflowTest(unittest.TestCase):
     def setUp(self):
-        engine = create_engine(
+        self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        Base.metadata.create_all(engine)
-        self.db = sessionmaker(bind=engine, autoflush=False)()
+        Base.metadata.create_all(self.engine)
+        self.db = sessionmaker(bind=self.engine, autoflush=False)()
         self.order = Order(customer_name="Тест", status="In Assembly")
         self.db.add(self.order)
         self.db.flush()
@@ -35,6 +35,7 @@ class MaterialTransferWorkflowTest(unittest.TestCase):
     def tearDown(self):
         self.db.rollback()
         self.db.close()
+        self.engine.dispose()
 
     def _issue_task(self, source_type: str, recipient_role: str):
         task = create_task(

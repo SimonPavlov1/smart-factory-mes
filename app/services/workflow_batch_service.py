@@ -1,9 +1,9 @@
 import uuid
-from datetime import datetime
 
 from sqlalchemy.orm import Session
 
 from app.models.production import WorkflowBatch, WorkflowBatchLine, WorkflowTask
+from app.time_utils import utcnow
 
 
 ACCUMULATIVE_TYPES = {
@@ -13,6 +13,7 @@ ACCUMULATIVE_TYPES = {
     "warehouse_finished_goods": ("finished_goods", "qty"),
 }
 ACTIVE_STATUSES = {"assigned", "open", "in_progress", "hold"}
+REOPENABLE_TYPES = {"tester_check", "packer_pack", "warehouse_finished_goods"}
 
 
 def workflow_cycle(task_type: str, payload: dict) -> str:
@@ -31,14 +32,19 @@ def find_accumulative_task(db: Session, order_id: int, task_type: str, payload: 
         return None
     order_item_id, product_id = _context_key(payload)
     cycle = workflow_cycle(task_type, payload)
+    statuses = [*ACTIVE_STATUSES]
+    if task_type in REOPENABLE_TYPES:
+        statuses.append("done")
     candidates = db.query(WorkflowTask).filter(
         WorkflowTask.order_id == order_id,
         WorkflowTask.type == task_type,
-        WorkflowTask.status.in_(ACTIVE_STATUSES),
-    ).order_by(WorkflowTask.id.asc()).all()
-    for task in candidates:
+        WorkflowTask.status.in_(statuses),
+    ).order_by(WorkflowTask.id.desc()).all()
+    active_candidates = [task for task in candidates if task.status in ACTIVE_STATUSES]
+    completed_candidates = [task for task in candidates if task.status == "done"]
+    for task in [*active_candidates, *completed_candidates]:
         existing = task.payload or {}
-        if workflow_cycle(task_type, existing) != cycle:
+        if task_type != "tester_check" and workflow_cycle(task_type, existing) != cycle:
             continue
         existing_order_item_id, existing_product_id = _context_key(existing)
         if order_item_id and existing_order_item_id == order_item_id:
@@ -73,6 +79,48 @@ def merge_accumulative_payload(task: WorkflowTask, incoming: dict):
     current = task.payload or {}
     merged = {**current}
     merged[collection] = _merge_lines(current.get(collection) or [], incoming.get(collection) or [], qty_key)
+    for list_key in ("unit_ids", "serial_numbers"):
+        merged[list_key] = list(dict.fromkeys([
+            *(current.get(list_key) or []),
+            *(incoming.get(list_key) or []),
+        ]))
+    for scalar_key in (
+        "pre_assembly",
+        "source_assembly_task_id",
+        "source_test_task_id",
+        "source_repair_task_id",
+        "source_pack_task_id",
+        "product_context",
+        "test_checklist",
+        "planned_qty",
+        "assembled_qty",
+    ):
+        if scalar_key in incoming:
+            merged[scalar_key] = incoming[scalar_key]
+    if task.type == "tester_check" and incoming.get("retest"):
+        merged["retest_serial_numbers"] = list(dict.fromkeys([
+            *(current.get("retest_serial_numbers") or []),
+            *(incoming.get("serial_numbers") or []),
+        ]))
+        repair_results = {
+            item.get("serial_number"): dict(item)
+            for item in (current.get("repair_results") or [])
+            if item.get("serial_number")
+        }
+        for item in incoming.get("repair_results") or []:
+            if item.get("serial_number"):
+                repair_results[item["serial_number"]] = dict(item)
+        merged["repair_results"] = list(repair_results.values())
+    if task.type == "repair_defects":
+        serial_defects = {
+            item.get("serial_number"): dict(item)
+            for item in (current.get("serial_defects") or [])
+            if item.get("serial_number")
+        }
+        for item in incoming.get("serial_defects") or []:
+            if item.get("serial_number"):
+                serial_defects[item["serial_number"]] = dict(item)
+        merged["serial_defects"] = list(serial_defects.values())
     source_ids = list(current.get("source_task_ids") or [])
     for key in ("source_assembly_task_id", "source_test_task_id", "source_repair_task_id", "source_pack_task_id"):
         source_id = incoming.get(key)
@@ -127,7 +175,7 @@ def consume_workflow_batches(db: Session, task: WorkflowTask, quantity: float):
                 break
         if all(float(line.processed_qty or 0) >= float(line.quantity or 0) for line in batch.lines):
             batch.status = "processed"
-            batch.processed_at = datetime.utcnow()
+            batch.processed_at = utcnow()
         else:
             batch.status = "processing"
         if remaining <= 0:
@@ -157,7 +205,7 @@ def batch_summary(db: Session, task: WorkflowTask) -> dict:
     }
 
 
-def pending_product_lines(db: Session, task: WorkflowTask) -> list[dict]:
+def pending_product_lines(db: Session, task: WorkflowTask, *, aggregate_all: bool = False) -> list[dict]:
     payload_lines = (task.payload or {}).get(
         ACCUMULATIVE_TYPES.get(task.type, ("product_lines", "qty"))[0]
     ) or []
@@ -169,16 +217,19 @@ def pending_product_lines(db: Session, task: WorkflowTask) -> list[dict]:
         WorkflowBatch.container_task_id == task.id,
         WorkflowBatch.status.in_(["queued", "processing"]),
     ).order_by(WorkflowBatch.id.asc()).all()
-    current_batch = next((
+    batches_to_include = batches if aggregate_all else [next((
         batch for batch in batches
         if any(float(line.processed_qty or 0) < float(line.quantity or 0) for line in batch.lines)
-    ), None)
-    for line in (current_batch.lines if current_batch else []):
-        if line.entity_type != "product":
+    ), None)]
+    for batch in batches_to_include:
+        if not batch:
             continue
-        quantity = max(float(line.quantity or 0) - float(line.processed_qty or 0), 0)
-        if quantity > 0:
-            pending[int(line.entity_id)] = pending.get(int(line.entity_id), 0) + quantity
+        for line in batch.lines:
+            if line.entity_type != "product":
+                continue
+            quantity = max(float(line.quantity or 0) - float(line.processed_qty or 0), 0)
+            if quantity > 0:
+                pending[int(line.entity_id)] = pending.get(int(line.entity_id), 0) + quantity
     return [
         {**metadata.get(product_id, {"product_id": product_id}), "qty": quantity}
         for product_id, quantity in pending.items()

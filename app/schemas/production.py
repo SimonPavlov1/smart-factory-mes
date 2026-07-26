@@ -87,6 +87,10 @@ class ProductCreateSchema(BaseModel):
     version: str = Field(default="1", description="Версия КД или ревизия платы")
     is_final: bool = Field(default=False, description="True, если это готовый продукт для продажи")
     test_checklist: List[str] = Field(default_factory=list, description="Пункты проверки изделия")
+    requires_preassembly_test: bool = Field(
+        default=False,
+        description="Проверять устройство до финальной сборки в корпус",
+    )
 
     # Рекурсивный список всех компонентов и узлов
     components: List[BOMItemCreate] = Field(default_factory=list)

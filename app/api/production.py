@@ -58,6 +58,7 @@ class ProductUpdate(BaseModel):
     drawing_number: Optional[str] = None
     revision: Optional[str] = "1.0"
     test_checklist: Optional[list[str]] = None
+    requires_preassembly_test: Optional[bool] = None
 
 
 def _safe_filename(filename: str):
@@ -101,6 +102,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
         revision=data.version,
         is_subassembly=is_subassembly,
         test_checklist=[item.strip() for item in (data.test_checklist or []) if item.strip()],
+        requires_preassembly_test=bool(data.requires_preassembly_test),
     )
     db.add(new_product)
     db.flush()
@@ -296,6 +298,7 @@ def get_all_products(
             "photo_url": product.photo_url,
             "attachments": product.attachments or [],
             "test_checklist": product.test_checklist or [],
+            "requires_preassembly_test": bool(product.requires_preassembly_test),
             "tree": _build_tree(product_items, warehouse_cache, products_cache, stock_cache),
             "sections": sections
         })
@@ -336,6 +339,8 @@ def update_product(
     product.revision = data.revision or "1.0"
     if data.test_checklist is not None:
         product.test_checklist = [item.strip() for item in data.test_checklist if item and item.strip()]
+    if data.requires_preassembly_test is not None:
+        product.requires_preassembly_test = bool(data.requires_preassembly_test)
     db.commit()
     db.refresh(product)
     return product

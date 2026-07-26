@@ -1,40 +1,67 @@
-# Спецификация структуры данных Smart Factory
+# Модель данных
 
-## 1. Слой моделей: Модуль `inventory.py`
+Источник истины — SQLAlchemy-модели в `app/models` и миграции `alembic/versions`.
 
-| **Сущность**  | **Поле**         | **Тип SQL** | **Ограничения** | **Описание / Бизнес-логика**        |
-|:--------------|:-----------------|:------------|:----------------|:------------------------------------|
-| **Component** | `id`             | Integer     | PK, Index       | Уникальный идентификатор детали.    |
-| (Справочник)  | `name`           | String      | Not Null, Index | Название типа (напр. *Резистор*).   |
-|               | `part_number`    | String      | Unique, Index   | MPN (артикул производителя).        |
-|               | `specifications` | JSON        | Nullable        | Доп. характеристики в формате JSON. |
-| **Stock**     | `id`             | Integer     | PK, Index       | ID записи склада.                   |
-| (Склад)       | `component_id`   | Integer     | FK, Unique      | Ссылка на карточку компонента.      |
-|               | `actual_qty`     | Float       | Default 0.0     | Фактическое количество на складе.   |
+## Основные сущности
 
----
+| Сущность | Назначение |
+|---|---|
+| `User` | Сотрудник, основная и дополнительные роли |
+| `Component` | Справочник комплектующих |
+| `Stock` | Остаток компонента или готового изделия |
+| `InventoryMovement` | Неизменяемая запись прихода, расхода или корректировки |
+| `ProductType` | Карточка изделия, децимальный номер, чек-лист |
+| `ProductBOM` | Иерархический состав изделия |
+| `BOMItemAlternative` | Допустимые замены компонента |
+| `Order`, `OrderItem` | Производственная заявка и позиции |
+| `Reservation` | Резерв компонента под заявку |
+| `Item` | Физический экземпляр с заводским номером |
+| `WorkflowTask` | Автоматическая или ручная задача |
+| `WorkflowBatch` | Партия внутри накопительной задачи |
+| `TaskQuantity` | Нормализованный учёт количеств задачи |
+| `MaterialTransfer` | Передача компонентов между складом и исполнителем |
+| `PurchaseOrder`, `PurchaseItem` | Закупка дефицита |
+| `TaskEvent` | Аудит действий по задаче |
+| `OrderCancellationObligation` | Обязательство для безопасной отмены |
 
-## 2. Слой моделей: Модуль `procurement.py`
+## Связи
 
-| **Сущность**      | **Поле**   | **Тип SQL** | **Ограничения** | **Описание / Бизнес-логика** |
-|:------------------|:-----------|:------------|:----------------|:-----------------------------|
-| **PurchaseOrder** | `id`       | Integer     | PK, Index       | ID транзакции закупки.       |
-| (Заказ)           | `status`   | String      | Index           | Статус: `Draft`, `Received`. |
-| **PurchaseItem**  | `order_id` | Integer     | FK              | Ссылка на заказ.             |
-| (Позиция)         | `qty`      | Float       | Not Null        | Заказанное количество.       |
+```text
+Order 1 ── N OrderItem ── 1 ProductType
+Order 1 ── N WorkflowTask
+Order 1 ── N Item
 
----
+ProductType 1 ── N ProductBOM
+ProductType 1 ── N Item
 
-## 3. Слой моделей: Модуль `production.py`
+WorkflowTask 1 ── N WorkflowBatch
+WorkflowTask 1 ── N TaskEvent
+WorkflowTask 1 ── N InventoryMovement
 
-| **Сущность**    | **Поле**        | **Тип SQL** | **Ограничения** | **Описание / Бизнес-логика**               |
-|:----------------|:----------------|:------------|:----------------|:-------------------------------------------|
-| **BOMMapping**  | `design_name`   | String      | Unique, Index   | Ключ поиска (напр. текст из ПЭ3).          |
-| (Маппинг)       | `component_id`  | Integer     | FK              | Ссылка на складской ID.                    |
-| **Order**       | `id`            | Integer     | PK              | Производственный заказ.                    |
-| (Производство)  | `status`        | String      | Index           | Статус: `New`, `In Progress`, `Completed`. |
-| **Reservation** | `id`            | Integer     | PK              | Бронирование деталей под заказ.            |
-| (Бронь)         | `component_id`  | Integer     | FK              | Что бронируем.                             |
-|                 | `qty`           | Float       | Not Null        | Сколько «заморожено» на складе.            |
-| **Item**        | `id`            | Integer     | PK              | Учет готовой продукции (SN).               |
-| (Готовое изд.)  | `serial_number` | String      | Unique, Index   | SN конкретного экземпляра.                 |
+Component 1 ── 1 Stock
+Component 1 ── N InventoryMovement
+```
+
+## Количества
+
+`Stock.actual_qty` — физический остаток. `Stock.reserved_qty` — часть остатка, закреплённая под заявки. Доступное количество вычисляется как:
+
+```text
+available = actual_qty - reserved_qty
+```
+
+Изменение `actual_qty` должно сопровождаться `InventoryMovement` с направлением и балансом после операции.
+
+## Экземпляры
+
+`Item` связывает заявку, позицию заказа, изделие и заводской номер. Временные поля фиксируют начало сборки, завершение сборки, тест, упаковку и оприходование.
+
+## Миграции
+
+Цепочка миграций линейная. Новая миграция должна ссылаться `down_revision` на текущую head и иметь рабочий `downgrade`.
+
+```bash
+alembic upgrade head
+```
+
+`Base.metadata.create_all()` допустим для пустой локальной базы, но не заменяет миграции существующей production-базы.

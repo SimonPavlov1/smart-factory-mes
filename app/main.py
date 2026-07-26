@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
 from app.database import engine, Base, SessionLocal
-from app.api import auth, inventory, production, procurement, manufacturing, tasks
+from app.api import auth, inventory, production, procurement, manufacturing, tasks, cancellations
 from app.services.auth_service import ensure_default_admin
 
 # Создаем все таблицы в базе данных на основе наших моделей.
@@ -48,9 +48,41 @@ with engine.begin() as conn:
         conn.execute(text("ALTER TABLE product_types ADD COLUMN attachments JSON"))
     if "test_checklist" not in product_columns:
         conn.execute(text("ALTER TABLE product_types ADD COLUMN test_checklist JSON"))
+    if "requires_preassembly_test" not in product_columns:
+        conn.execute(text(
+            "ALTER TABLE product_types ADD COLUMN requires_preassembly_test BOOLEAN DEFAULT 0 NOT NULL"
+        ))
     order_columns = {column["name"] for column in inspect(conn).get_columns("orders")}
     if "planned_delivery_date" not in order_columns:
         conn.execute(text("ALTER TABLE orders ADD COLUMN planned_delivery_date DATETIME"))
+    item_columns = {column["name"] for column in inspect(conn).get_columns("items")}
+    item_additions = {
+        "order_item_id": "INTEGER",
+        "product_id": "INTEGER",
+        "assembly_task_id": "INTEGER",
+        "assigned_user_id": "INTEGER",
+        "status": "VARCHAR DEFAULT 'planned' NOT NULL",
+        "defect_note": "TEXT",
+        "created_at": "DATETIME",
+        "assembly_started_at": "DATETIME",
+        "assembled_at": "DATETIME",
+        "tested_at": "DATETIME",
+        "packed_at": "DATETIME",
+        "stocked_at": "DATETIME",
+    }
+    for column_name, column_type in item_additions.items():
+        if column_name not in item_columns:
+            conn.execute(text(f"ALTER TABLE items ADD COLUMN {column_name} {column_type}"))
+    if not inspect(conn).has_table("factory_number_sequences"):
+        conn.execute(text("""
+            CREATE TABLE factory_number_sequences (
+                id INTEGER NOT NULL PRIMARY KEY,
+                prefix VARCHAR NOT NULL,
+                year INTEGER NOT NULL,
+                last_value INTEGER NOT NULL DEFAULT 0,
+                CONSTRAINT uq_factory_number_prefix_year UNIQUE (prefix, year)
+            )
+        """))
     if not inspect(conn).has_table("bom_item_alternatives"):
         conn.execute(text("""
             CREATE TABLE bom_item_alternatives (
@@ -72,7 +104,7 @@ with SessionLocal() as db:
 app = FastAPI(
     title="Smart Factory MES API",
     description="Система управления составом изделий (BOM) и складским учетом комплектации.",
-    version="1.1.0"
+    version="2.0.0"
 )
 
 # Настройка CORS (Cross-Origin Resource Sharing).
@@ -92,6 +124,7 @@ app.include_router(production.router, prefix="/production", tags=["Произв�
 app.include_router(procurement.router, prefix="/procurement", tags=["Закупки (Procurement)"])
 app.include_router(manufacturing.router)
 app.include_router(tasks.router)
+app.include_router(cancellations.router)
 app.include_router(auth.router)
 
 @app.get("/", tags=["Системные"])
@@ -100,6 +133,6 @@ def read_root():
     return {
         "status": "online",
         "service": "Smart Factory MES",
-        "version": "1.1.0",
+        "version": "2.0.0",
         "documentation": "/docs"
     }

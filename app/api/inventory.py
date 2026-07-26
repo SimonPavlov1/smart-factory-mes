@@ -291,9 +291,11 @@ def add_stock(
     quantity: float,
     location: str = "Warehouse-1",
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse")),
+    user: User = Depends(require_roles("admin", "warehouse")),
 ):
     """Оприходование количества компонента на склад."""
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="Количество для оприходования должно быть больше нуля")
     if not db.query(Component).get(component_id):
         raise HTTPException(status_code=404, detail="Компонент не найден")
 
@@ -306,6 +308,16 @@ def add_stock(
         stock_item = Stock(component_id=component_id, actual_qty=quantity, location=location)
         db.add(stock_item)
 
+    record_movement(
+        db,
+        direction="incoming",
+        quantity=quantity,
+        balance_after=stock_item.actual_qty,
+        component_id=component_id,
+        location=stock_item.location,
+        actor_user_id=user.id,
+        note="Ручное оприходование комплектующих",
+    )
     db.commit()
     return {"status": "success", "new_qty": stock_item.actual_qty}
 
@@ -353,15 +365,33 @@ def update_stock_quantity(
     component_id: int,
     new_quantity: float,
     db: Session = Depends(get_db),
-    _=Depends(require_roles("admin", "warehouse")),
+    user: User = Depends(require_roles("admin", "warehouse")),
 ):
     """Прямое обновление количества компонента на складе."""
+    if new_quantity < 0:
+        raise HTTPException(status_code=400, detail="Остаток не может быть отрицательным")
+    if not db.query(Component).get(component_id):
+        raise HTTPException(status_code=404, detail="Компонент не найден")
+
     stock = db.query(Stock).filter(Stock.component_id == component_id).first()
+    previous_quantity = float(stock.actual_qty or 0) if stock else 0.0
     if not stock:
-        stock = Stock(component_id=component_id, actual_qty=new_quantity)
+        stock = Stock(component_id=component_id, actual_qty=new_quantity, location="Warehouse-1")
         db.add(stock)
     else:
         stock.actual_qty = new_quantity
 
+    difference = float(new_quantity) - previous_quantity
+    if difference:
+        record_movement(
+            db,
+            direction="incoming" if difference > 0 else "outgoing",
+            quantity=abs(difference),
+            balance_after=new_quantity,
+            component_id=component_id,
+            location=stock.location,
+            actor_user_id=user.id,
+            note=f"Ручная корректировка остатка: {previous_quantity:g} → {float(new_quantity):g}",
+        )
     db.commit()
     return {"status": "success", "new_qty": stock.actual_qty}

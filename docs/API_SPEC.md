@@ -1,53 +1,114 @@
-# API Спецификация системы управления производством
+# API Smart Factory MES
 
-Базовый URL: `http://127.0.0.1:8000`
+Актуальная интерактивная спецификация генерируется FastAPI:
 
----
+- Swagger UI: `http://127.0.0.1:8000/docs`;
+- OpenAPI: `http://127.0.0.1:8000/openapi.json`.
 
-## 1. Inventory Management (Складской учет)
+Все защищённые методы принимают заголовок:
 
-### 1.1 Компоненты
-- **GET /components** — Получение списка компонентов (поддержка `?search=...`).
-- **POST /components** — Регистрация нового компонента.
-- **GET /components/categories** — Список уникальных категорий.
-- **GET /components/{component_id}** — Карточка компонента.
-- **PUT /components/{component_id}** — Обновление параметров компонента.
-- **DELETE /components/{component_id}** — Удаление компонента и остатков.
+```http
+Authorization: Bearer <token>
+```
 
-### 1.2 Управление остатками
-- **POST /incoming** — Оприходование (приход) количества.
-- **PATCH /components/{component_id}/quantity** — Прямая корректировка остатка.
+## Авторизация и сотрудники
 
----
+| Метод | Путь | Назначение |
+|---|---|---|
+| POST | `/auth/login` | Получить токен |
+| GET | `/auth/me` | Текущий пользователь, роли и права |
+| GET | `/users` | Доступные сотрудники |
+| GET/POST | `/admin/users` | Управление сотрудниками |
+| PUT/DELETE | `/admin/users/{user_id}` | Изменение или удаление сотрудника |
 
-## 2. Production Engineering (Инжиниринг и BOM)
+## Склад
 
-### 2.1 Изделия
-- **GET /products** — Список изделий с группировкой по секциям.
-- **POST /setup-product** — Атомарная загрузка структуры изделия.
-- **DELETE /products/{product_id}** — Каскадное удаление изделия и связей.
+Префикс: `/inventory`.
 
-### 2.2 Работа с составом (BOM)
-- **POST /process-bom/{product_id}** — Ручное добавление/привязка позиций в спецификацию.
-- **POST /products/{product_id}/resolve-bom** — Автоматический маппинг компонентов (умный подбор).
-- **PUT /bom-items/{item_id}** — Обновление строки спецификации и переопределение привязки.
-- **DELETE /bom-items/{item_id}** — Удаление позиции из состава изделия.
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET/POST | `/components` | Список или создание компонента |
+| GET | `/components/page` | Пагинированный каталог |
+| GET | `/components/search` | Поиск |
+| GET | `/components/categories` | Категории |
+| GET/PUT/DELETE | `/components/{id}` | Карточка и изменение |
+| POST | `/incoming` | Приход компонента |
+| PATCH | `/components/{id}/quantity` | Ручная корректировка с движением |
+| GET | `/movements` | История движений |
+| GET | `/finished-goods` | Остатки готовой продукции |
+| POST | `/finished-goods/{product_id}/issue` | Выдача готовой продукции |
 
----
+## Изделия и BOM
 
-## 3. Procurement (Снабжение)
+Префикс: `/production`.
 
-### 3.1 Заказы
-- **POST /orders** — Создание черновика заказа поставщику.
-- **POST /orders/{order_id}/receive** — Финальная приемка заказа (статус -> Received, пополнение склада).
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/products` | База изделий |
+| POST | `/setup-product` | Создать изделие со структурой |
+| PUT/DELETE | `/products/{id}` | Изменить или удалить |
+| POST | `/products/{id}/photo` | Фото |
+| POST | `/products/{id}/attachments` | Документы |
+| POST | `/process-bom/{id}` | Добавить BOM |
+| POST | `/products/{id}/resolve-bom` | Автоматическое сопоставление |
+| GET | `/bom-items/{id}/match-candidates` | Кандидаты детали |
+| PUT/DELETE | `/bom-items/{id}` | Строка BOM |
+| POST/PUT/DELETE | `/bom-items/{id}/alternatives...` | Альтернативные компоненты |
 
----
+## Производственные заявки
 
-## Коды ответов
+Префикс: `/manufacturing`.
 
-| Код     | Значение     | Описание                                 |
-|:--------|:-------------|:-----------------------------------------|
-| **200** | OK           | Успешное выполнение.                     |
-| **400** | Bad Request  | Ошибка валидации / недостаточно данных.  |
-| **404** | Not Found    | Ресурс не найден.                        |
-| **500** | Server Error | Внутренняя ошибка (транзакция отменена). |
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET/POST | `/orders` | Список или создание заявки |
+| GET/DELETE | `/orders/{id}` | Карточка или удаление |
+| POST | `/orders/{id}/issue-materials` | Выдача материалов |
+| GET | `/orders/{id}/bom-summary` | Сводка BOM |
+| GET | `/orders/{id}/bom-summary.xlsx` | Ведомость XLSX |
+| GET | `/orders/{id}/shortages.xlsx` | Дефицит XLSX |
+
+Отмена:
+
+| Метод | Путь |
+|---|---|
+| POST | `/manufacturing/orders/{id}/cancellation/request` |
+| GET | `/manufacturing/orders/{id}/cancellation` |
+| POST | `/manufacturing/orders/{id}/cancellation/approve` |
+| POST | `/manufacturing/orders/{id}/cancellation/obligations/{obligation_id}/resolve` |
+
+## Задачи
+
+Префикс: `/tasks`.
+
+Основные методы:
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/` | Все задачи для руководителя |
+| GET | `/mine` | Доступная пользователю очередь |
+| GET | `/{id}` | Полная карточка |
+| POST | `/manual` | Ручная задача |
+| POST | `/{id}/take` | Взять в работу |
+| POST | `/{id}/complete` | Завершить или передать часть |
+| POST | `/{id}/assign` | Назначить |
+| POST | `/{id}/hold`, `/{id}/resume` | Приостановить или продолжить |
+| POST | `/{id}/deadline` | Изменить срок с причиной |
+| POST | `/{id}/notes` | Комментарий |
+| GET | `/{id}/events` | Аудит событий |
+| POST | `/{id}/testing-claims` | Закрепить устройства тестировщика |
+| POST | `/{id}/assembly-claims` | Закрепить устройства сборщика |
+
+Для мутаций workflow frontend передаёт ключ идемпотентности. Повторная команда с тем же ключом возвращает сохранённый результат.
+
+## Ошибки
+
+| Код | Значение |
+|---|---|
+| 400 | Бизнес-правило не выполнено |
+| 401 | Нет или истёк токен |
+| 403 | Недостаточно прав |
+| 404 | Сущность не найдена |
+| 409 | Конфликт параллельной работы |
+| 422 | Ошибка входных данных |
+| 500 | Необработанная ошибка сервера |

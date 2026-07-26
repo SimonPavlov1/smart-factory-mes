@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from io import BytesIO
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -345,9 +345,15 @@ def _parse_optional_date(value: str | None):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         raise HTTPException(status_code=400, detail="Некорректная дата поставки")
+    if parsed.date() < date.today():
+        raise HTTPException(
+            status_code=400,
+            detail="Плановая дата поставки не может быть раньше сегодняшнего дня",
+        )
+    return parsed
 
 
 def _user_payload(user: User | None):
@@ -431,6 +437,8 @@ def _order_payload(order: Order, db: Session):
         "customer_name": order.customer_name,
         "status": progress["state"],
         "legacy_status": order.status,
+        "cancellation_status": order.cancellation_status,
+        "cancellation_reason": order.cancellation_reason,
         "progress": progress,
         "created_at": order.created_at,
         "planned_delivery_date": order.planned_delivery_date,

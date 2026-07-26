@@ -143,14 +143,14 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require_roles("a
 def list_active_users(
     role: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("admin", "manager")),
+    _: User = Depends(require_roles("admin", "manager", "production_manager")),
 ):
     query = db.query(User).filter(User.is_active == True)
     if role:
         _validate_role(role)
         users = [
             user for user in query.order_by(User.full_name, User.username).all()
-            if role in user_roles(user) or user_has_role(user, "admin", "manager")
+            if role in user_roles(user) or user_has_role(user, "admin", "manager", "production_manager")
         ]
         return [_user_out(user) for user in users]
     return [_user_out(user) for user in query.order_by(User.full_name, User.username).all()]
