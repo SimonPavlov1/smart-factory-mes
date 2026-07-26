@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.database import get_db
 from app.models.production import ProductType, ProductBOM, BOMMapping, BOMItemAlternative
@@ -59,6 +59,7 @@ class ProductUpdate(BaseModel):
     revision: Optional[str] = "1.0"
     test_checklist: Optional[list[str]] = None
     requires_preassembly_test: Optional[bool] = None
+    factory_number_start: Optional[int] = Field(default=None, ge=1)
 
 
 def _safe_filename(filename: str):
@@ -98,6 +99,7 @@ def create_product_recursive(data: ProductCreateSchema, db: Session):
 
     new_product = ProductType(
         name=data.name,
+        factory_number_start=data.factory_number_start,
         drawing_number=data.drawing_number,
         revision=data.version,
         is_subassembly=is_subassembly,
@@ -299,6 +301,7 @@ def get_all_products(
             "attachments": product.attachments or [],
             "test_checklist": product.test_checklist or [],
             "requires_preassembly_test": bool(product.requires_preassembly_test),
+            "factory_number_start": product.factory_number_start or 1,
             "tree": _build_tree(product_items, warehouse_cache, products_cache, stock_cache),
             "sections": sections
         })
@@ -341,6 +344,8 @@ def update_product(
         product.test_checklist = [item.strip() for item in data.test_checklist if item and item.strip()]
     if data.requires_preassembly_test is not None:
         product.requires_preassembly_test = bool(data.requires_preassembly_test)
+    if data.factory_number_start is not None:
+        product.factory_number_start = data.factory_number_start
     db.commit()
     db.refresh(product)
     return product

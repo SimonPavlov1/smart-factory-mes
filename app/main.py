@@ -52,6 +52,10 @@ with engine.begin() as conn:
         conn.execute(text(
             "ALTER TABLE product_types ADD COLUMN requires_preassembly_test BOOLEAN DEFAULT 0 NOT NULL"
         ))
+    if "factory_number_start" not in product_columns:
+        conn.execute(text(
+            "ALTER TABLE product_types ADD COLUMN factory_number_start INTEGER DEFAULT 1 NOT NULL"
+        ))
     order_columns = {column["name"] for column in inspect(conn).get_columns("orders")}
     if "planned_delivery_date" not in order_columns:
         conn.execute(text("ALTER TABLE orders ADD COLUMN planned_delivery_date DATETIME"))
@@ -104,7 +108,7 @@ with SessionLocal() as db:
 app = FastAPI(
     title="Smart Factory MES API",
     description="Система управления составом изделий (BOM) и складским учетом комплектации.",
-    version="2.0.0"
+    version="2.0.1"
 )
 
 # Настройка CORS (Cross-Origin Resource Sharing).
@@ -133,6 +137,6 @@ def read_root():
     return {
         "status": "online",
         "service": "Smart Factory MES",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "documentation": "/docs"
     }

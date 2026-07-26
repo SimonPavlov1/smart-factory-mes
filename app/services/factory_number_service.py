@@ -31,13 +31,18 @@ def create_product_units(
         .with_for_update()
         .first()
     )
+    configured_start = max(1, product.factory_number_start or 1)
     if not sequence:
-        sequence = FactoryNumberSequence(prefix=prefix, year=sequence_scope, last_value=0)
+        sequence = FactoryNumberSequence(
+            prefix=prefix,
+            year=sequence_scope,
+            last_value=configured_start - 1,
+        )
         db.add(sequence)
         db.flush()
 
-    start = sequence.last_value + 1
-    sequence.last_value += quantity
+    start = max(sequence.last_value + 1, configured_start)
+    sequence.last_value = start + quantity - 1
     units = []
     for number in range(start, start + quantity):
         unit = Item(

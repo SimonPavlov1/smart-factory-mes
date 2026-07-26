@@ -38,6 +38,12 @@ class ProductType(Base):
     name = Column(String, nullable=False, comment="Понятное имя (напр. 'Плата управления двигателем')")
     sku = Column(String, unique=True, index=True, comment="Внутренний код/артикул готового товара")
     drawing_number = Column(String, index=True, nullable=True, comment="Децимальный номер по ГОСТ (напр. РСДТ...)")
+    factory_number_start = Column(
+        Integer,
+        default=1,
+        nullable=False,
+        comment="Первый числовой суффикс заводского номера для новых экземпляров",
+    )
 
     is_subassembly = Column(Boolean, default=False,
                             comment="True, если это не готовый продукт, а вложенный узел (полуфабрикат).")

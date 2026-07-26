@@ -84,6 +84,11 @@ class ProductCreateSchema(BaseModel):
     """
     name: str = Field(..., example="Плата управления", description="Понятное название изделия")
     drawing_number: str = Field(..., example="РСДТ.421243.320", description="Децимальный номер чертежа")
+    factory_number_start: int = Field(
+        default=1,
+        ge=1,
+        description="С какого числового суффикса начинать выдачу заводских номеров",
+    )
     version: str = Field(default="1", description="Версия КД или ревизия платы")
     is_final: bool = Field(default=False, description="True, если это готовый продукт для продажи")
     test_checklist: List[str] = Field(default_factory=list, description="Пункты проверки изделия")

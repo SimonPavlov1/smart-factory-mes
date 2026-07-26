@@ -87,6 +87,61 @@ class FactoryNumberTest(unittest.TestCase):
             ["АБВГ.123456.001-001", "АБВГ.123456.001-002"],
         )
 
+    def test_configured_start_is_used_for_first_factory_number(self):
+        self.product.factory_number_start = 100
+
+        units = create_product_units(
+            self.db,
+            order_id=self.order.id,
+            order_item_id=self.order_item.id,
+            product=self.product,
+            assembly_task_id=self.task.id,
+            assigned_user_id=self.user.id,
+            quantity=2,
+        )
+
+        self.assertEqual(
+            [unit.serial_number for unit in units],
+            ["UTUD-100", "UTUD-101"],
+        )
+
+    def test_start_change_never_reuses_issued_factory_numbers(self):
+        self.product.factory_number_start = 10
+        first = create_product_units(
+            self.db,
+            order_id=self.order.id,
+            order_item_id=self.order_item.id,
+            product=self.product,
+            assembly_task_id=self.task.id,
+            assigned_user_id=self.user.id,
+            quantity=2,
+        )
+        self.product.factory_number_start = 1
+        continued = create_product_units(
+            self.db,
+            order_id=self.order.id,
+            order_item_id=self.order_item.id,
+            product=self.product,
+            assembly_task_id=self.task.id,
+            assigned_user_id=self.user.id,
+            quantity=1,
+        )
+        self.product.factory_number_start = 20
+        advanced = create_product_units(
+            self.db,
+            order_id=self.order.id,
+            order_item_id=self.order_item.id,
+            product=self.product,
+            assembly_task_id=self.task.id,
+            assigned_user_id=self.user.id,
+            quantity=1,
+        )
+
+        self.assertEqual(
+            [unit.serial_number for unit in [*first, *continued, *advanced]],
+            ["UTUD-010", "UTUD-011", "UTUD-012", "UTUD-020"],
+        )
+
     def test_testing_task_keeps_serial_numbers_from_processed_and_new_batches(self):
         first_units = create_product_units(
             self.db,
