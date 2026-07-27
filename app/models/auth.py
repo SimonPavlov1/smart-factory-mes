@@ -16,5 +16,8 @@ class User(Base):
     phone = Column(String, nullable=True)
     role = Column(String, nullable=False, default="manager", index=True)
     roles = Column(JSON, nullable=True)
+    task_roles = Column(JSON, nullable=True)
+    auto_tasks_enabled = Column(Boolean, default=True, nullable=False)
+    manual_assignment_enabled = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, server_default=func.now())

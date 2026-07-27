@@ -12,6 +12,16 @@ from app.services.auth_service import ensure_default_admin
 Base.metadata.create_all(bind=engine)
 with engine.begin() as conn:
     user_columns = {column["name"] for column in inspect(conn).get_columns("users")}
+    if "task_roles" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN task_roles JSON"))
+    if "auto_tasks_enabled" not in user_columns:
+        conn.execute(text(
+            "ALTER TABLE users ADD COLUMN auto_tasks_enabled BOOLEAN DEFAULT TRUE NOT NULL"
+        ))
+    if "manual_assignment_enabled" not in user_columns:
+        conn.execute(text(
+            "ALTER TABLE users ADD COLUMN manual_assignment_enabled BOOLEAN DEFAULT TRUE NOT NULL"
+        ))
     if "last_name" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN last_name VARCHAR"))
     if "first_name" not in user_columns:
@@ -32,6 +42,26 @@ with engine.begin() as conn:
         conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN due_date DATETIME"))
     if "sort_order" not in columns:
         conn.execute(text("ALTER TABLE workflow_tasks ADD COLUMN sort_order INTEGER DEFAULT 0 NOT NULL"))
+    task_additions = {
+        "product_id": "INTEGER",
+        "created_by_user_id": "INTEGER",
+        "is_manual": "BOOLEAN DEFAULT FALSE NOT NULL",
+        "priority": "VARCHAR DEFAULT 'normal' NOT NULL",
+        "planned_start_at": "DATETIME",
+        "estimated_minutes": "INTEGER",
+        "actual_minutes": "INTEGER",
+        "sla_due_at": "DATETIME",
+        "deadline_change_reason": "TEXT",
+        "hold_reason": "TEXT",
+        "cancel_reason": "TEXT",
+        "cancelled_at": "DATETIME",
+        "updated_at": "DATETIME",
+    }
+    for column_name, column_type in task_additions.items():
+        if column_name not in columns:
+            conn.execute(text(
+                f"ALTER TABLE workflow_tasks ADD COLUMN {column_name} {column_type}"
+            ))
     bom_columns = {column["name"] for column in inspect(conn).get_columns("product_boms")}
     if "parent_id" not in bom_columns:
         conn.execute(text("ALTER TABLE product_boms ADD COLUMN parent_id INTEGER"))
@@ -59,6 +89,22 @@ with engine.begin() as conn:
     order_columns = {column["name"] for column in inspect(conn).get_columns("orders")}
     if "planned_delivery_date" not in order_columns:
         conn.execute(text("ALTER TABLE orders ADD COLUMN planned_delivery_date DATETIME"))
+    order_additions = {
+        "cancellation_status": "VARCHAR",
+        "cancellation_reason": "TEXT",
+        "cancellation_requested_at": "DATETIME",
+        "cancellation_requested_by": "INTEGER",
+        "cancellation_approved_at": "DATETIME",
+        "cancellation_approved_by": "INTEGER",
+        "cancelled_at": "DATETIME",
+        "financial_impact": "FLOAT DEFAULT 0 NOT NULL",
+        "cancellation_summary": "JSON",
+    }
+    for column_name, column_type in order_additions.items():
+        if column_name not in order_columns:
+            conn.execute(text(
+                f"ALTER TABLE orders ADD COLUMN {column_name} {column_type}"
+            ))
     item_columns = {column["name"] for column in inspect(conn).get_columns("items")}
     item_additions = {
         "order_item_id": "INTEGER",
@@ -108,7 +154,7 @@ with SessionLocal() as db:
 app = FastAPI(
     title="Smart Factory MES API",
     description="Система управления составом изделий (BOM) и складским учетом комплектации.",
-    version="2.0.1"
+    version="2.0.2"
 )
 
 # Настройка CORS (Cross-Origin Resource Sharing).
@@ -137,6 +183,6 @@ def read_root():
     return {
         "status": "online",
         "service": "Smart Factory MES",
-        "version": "2.0.1",
+        "version": "2.0.2",
         "documentation": "/docs"
     }

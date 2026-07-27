@@ -39,6 +39,9 @@ class UserCreate(BaseModel):
     phone: Optional[str] = None
     role: str = Field(default="manager")
     roles: Optional[List[str]] = None
+    task_roles: Optional[List[str]] = None
+    auto_tasks_enabled: bool = True
+    manual_assignment_enabled: bool = True
 
 
 class UserUpdate(BaseModel):
@@ -49,6 +52,9 @@ class UserUpdate(BaseModel):
     phone: Optional[str] = None
     role: Optional[str] = None
     roles: Optional[List[str]] = None
+    task_roles: Optional[List[str]] = None
+    auto_tasks_enabled: Optional[bool] = None
+    manual_assignment_enabled: Optional[bool] = None
     is_active: Optional[bool] = None
     password: Optional[str] = Field(default=None, min_length=6)
 
@@ -63,6 +69,9 @@ class UserOut(BaseModel):
     phone: Optional[str] = None
     role: str
     roles: List[str] = Field(default_factory=list)
+    task_roles: List[str] = Field(default_factory=list)
+    auto_tasks_enabled: bool = True
+    manual_assignment_enabled: bool = True
     is_active: bool
 
     class Config:
