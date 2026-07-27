@@ -15,6 +15,7 @@ from app.services.auth_service import (
     require_roles,
     user_has_role,
     user_roles,
+    user_task_roles,
     verify_password,
 )
 
@@ -98,6 +99,9 @@ def _user_out(user: User) -> UserOut:
         phone=user.phone,
         role=user.role,
         roles=roles,
+        task_roles=user_task_roles(user),
+        auto_tasks_enabled=user.auto_tasks_enabled,
+        manual_assignment_enabled=user.manual_assignment_enabled,
         is_active=user.is_active,
     )
 
@@ -129,13 +133,16 @@ def get_me(user: User = Depends(get_current_user)):
         phone=user.phone,
         role=user.role,
         roles=roles,
+        task_roles=user_task_roles(user),
+        auto_tasks_enabled=user.auto_tasks_enabled,
+        manual_assignment_enabled=user.manual_assignment_enabled,
         is_active=user.is_active,
         permissions=permissions_for_roles(roles),
     )
 
 
 @router.get("/admin/users", response_model=list[UserOut])
-def list_users(db: Session = Depends(get_db), _: User = Depends(require_roles("admin"))):
+def list_users(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return [_user_out(user) for user in db.query(User).order_by(User.username).all()]
 
 
@@ -143,23 +150,30 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require_roles("a
 def list_active_users(
     role: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("admin", "manager", "production_manager")),
+    _: User = Depends(get_current_user),
 ):
     query = db.query(User).filter(User.is_active == True)
     if role:
         _validate_role(role)
         users = [
             user for user in query.order_by(User.full_name, User.username).all()
-            if role in user_roles(user) or user_has_role(user, "admin", "manager", "production_manager")
+            if user.manual_assignment_enabled and role in user_task_roles(user)
         ]
         return [_user_out(user) for user in users]
     return [_user_out(user) for user in query.order_by(User.full_name, User.username).all()]
 
 
 @router.post("/admin/users", response_model=UserOut)
-def create_user(payload: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_roles("admin"))):
+def create_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "manager")),
+):
     roles = _validate_roles(payload.roles, payload.role)
+    if "admin" in roles and "admin" not in user_roles(current_user):
+        raise HTTPException(status_code=403, detail="Менеджер не может создавать администратора")
     primary_role = roles[0]
+    task_roles = _validate_roles(payload.task_roles, None) if payload.task_roles is not None else list(roles)
     phone = _normalize_phone(payload.phone)
     if not phone:
         raise HTTPException(status_code=422, detail="Телефон обязателен")
@@ -179,6 +193,9 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), _: User = De
         phone=phone,
         role=primary_role,
         roles=roles,
+        task_roles=task_roles,
+        auto_tasks_enabled=payload.auto_tasks_enabled,
+        manual_assignment_enabled=payload.manual_assignment_enabled,
         is_active=True,
     )
     user.full_name = _full_name_from_parts(user)
@@ -193,16 +210,28 @@ def update_user(
     user_id: int,
     payload: UserUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("admin")),
+    current_user: User = Depends(require_roles("admin", "manager")),
 ):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
+    current_is_admin = "admin" in user_roles(current_user)
+    target_is_admin = "admin" in user_roles(user)
+    if target_is_admin and not current_is_admin:
+        raise HTTPException(status_code=403, detail="Менеджер не может редактировать администратора")
 
     if payload.roles is not None or payload.role is not None:
         roles = _validate_roles(payload.roles, payload.role or user.role)
+        if "admin" in roles and not current_is_admin:
+            raise HTTPException(status_code=403, detail="Менеджер не может назначать роль администратора")
         user.roles = roles
         user.role = roles[0]
+    if payload.task_roles is not None:
+        user.task_roles = _validate_roles(payload.task_roles, None)
+    if payload.auto_tasks_enabled is not None:
+        user.auto_tasks_enabled = payload.auto_tasks_enabled
+    if payload.manual_assignment_enabled is not None:
+        user.manual_assignment_enabled = payload.manual_assignment_enabled
     if payload.full_name is not None:
         user.full_name = _clean(payload.full_name)
     if payload.last_name is not None:
@@ -234,7 +263,7 @@ def update_user(
 def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("admin")),
+    current_user: User = Depends(require_roles("admin", "manager")),
 ):
     if current_user.id == user_id:
         raise HTTPException(status_code=400, detail="Нельзя удалить текущую учетную запись")
@@ -242,6 +271,8 @@ def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if "admin" in user_roles(user) and "admin" not in user_roles(current_user):
+        raise HTTPException(status_code=403, detail="Менеджер не может удалить администратора")
 
     db.query(WorkflowTask).filter(
         WorkflowTask.assigned_user_id == user_id,

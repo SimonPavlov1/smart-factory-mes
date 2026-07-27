@@ -135,6 +135,16 @@ def user_has_role(user: User, *roles: str) -> bool:
     return "admin" in current_roles or bool(current_roles.intersection(roles))
 
 
+def user_task_roles(user: User) -> list[str]:
+    """Очереди задач пользователя, отделённые от его прав доступа."""
+    if isinstance(user.task_roles, list):
+        return list(dict.fromkeys(
+            role for role in user.task_roles if isinstance(role, str) and role
+        ))
+    # Совместимость с пользователями, созданными до появления настройки очередей.
+    return user_roles(user)
+
+
 def permissions_for_role(role: str):
     return ROLE_PERMISSIONS.get(role, [])
 
@@ -158,6 +168,9 @@ def ensure_default_admin(db: Session):
         full_name="Администратор",
         role="admin",
         roles=["admin"],
+        task_roles=[],
+        auto_tasks_enabled=True,
+        manual_assignment_enabled=True,
         is_active=True,
     ))
     db.commit()

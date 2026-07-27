@@ -10,7 +10,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -28,7 +28,13 @@ from app.models.production import (
     WorkflowCommand,
     WorkflowTask,
 )
-from app.services.auth_service import get_current_user, require_roles, user_has_role, user_roles
+from app.services.auth_service import (
+    get_current_user,
+    require_roles,
+    user_has_role,
+    user_roles,
+    user_task_roles,
+)
 from app.services.workflow_service import _open_material_flow_tasks, add_procurement_purchase, cleanup_premature_assembly_tasks, complete_task, enrich_component_lines, ensure_assembly_tasks_after_receipts, ensure_missing_order_item_workflows, ensure_procurement_payment_tasks, merge_order_procurement_tasks, normalize_assembly_task_payload, normalize_task_daily_progress, reconcile_procurement_tasks_with_stock, reconcile_stock_reservations, split_aggregate_assembly_tasks
 from app.services.xlsx_service import build_table_xlsx
 from app.services.workflow_batch_service import ACCUMULATIVE_TYPES, batch_summary, pending_product_lines
@@ -407,12 +413,9 @@ def _task_payload(task: WorkflowTask, db: Session | None = None):
 
 
 def _can_access_task(task: WorkflowTask, user: User):
-    if user_has_role(user, "admin", "manager", "production_manager"):
+    if user_has_role(user, "admin", "manager"):
         return True
-    if (
-        (task.type == "tester_check" and user_has_role(user, "tester"))
-        or (task.type == "assembler_build" and user_has_role(user, "assembler"))
-    ):
+    if user.auto_tasks_enabled and task.role in user_task_roles(user):
         return True
     if task.type == "assembler_build":
         for assignment in (task.payload or {}).get("assembly_assignments") or []:
@@ -420,7 +423,7 @@ def _can_access_task(task: WorkflowTask, user: User):
                 return True
     if task.assigned_user_id:
         return task.assigned_user_id == user.id
-    return task.role in user_roles(user)
+    return user.auto_tasks_enabled and task.role in user_task_roles(user)
 
 
 @router.get("/{task_id}/form.xlsx")
@@ -470,9 +473,9 @@ def _can_work_task(task: WorkflowTask, user: User):
         for assignment in (task.payload or {}).get("assembly_assignments") or []:
             if assignment.get("user_id") == user.id:
                 return True
-    if task.type == "tester_check" and user_has_role(user, "tester"):
+    if task.type == "tester_check" and "tester" in user_task_roles(user):
         return True
-    if task.type == "assembler_build" and user_has_role(user, "assembler"):
+    if task.type == "assembler_build" and "assembler" in user_task_roles(user):
         return True
     return user_has_role(user, "admin", "manager", "production_manager") or task.assigned_user_id == user.id
 
@@ -503,8 +506,10 @@ def _assignee_or_404(db: Session, user_id: int | None, role: str) -> User | None
     assignee = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not assignee:
         raise HTTPException(status_code=404, detail="Сотрудник не найден")
-    if role not in user_roles(assignee) and not user_has_role(assignee, "admin", "manager", "production_manager"):
-        raise HTTPException(status_code=422, detail="Роль сотрудника не совпадает с ролью задачи")
+    if not assignee.manual_assignment_enabled:
+        raise HTTPException(status_code=422, detail="Для сотрудника отключено ручное назначение задач")
+    if role not in user_task_roles(assignee):
+        raise HTTPException(status_code=422, detail="Очередь этой задачи не включена у сотрудника")
     return assignee
 
 
@@ -585,19 +590,14 @@ def get_my_tasks(
     ensure_assembly_tasks_after_receipts(db)
     db.flush()
     query = db.query(WorkflowTask)
-    if not user_has_role(user, "admin"):
-        roles = user_roles(user)
-        role_conditions = [WorkflowTask.role.in_(roles), WorkflowTask.type == "assembler_build"]
-        assignee_conditions = [
+    roles = user_task_roles(user) if user.auto_tasks_enabled else []
+    query = query.filter(or_(
+        WorkflowTask.assigned_user_id == user.id,
+        and_(
             WorkflowTask.assigned_user_id.is_(None),
-            WorkflowTask.assigned_user_id == user.id,
-            WorkflowTask.type == "assembler_build",
-            WorkflowTask.type == "tester_check",
-        ]
-        query = query.filter(
-            or_(*role_conditions),
-            or_(*assignee_conditions),
-        )
+            WorkflowTask.role.in_(roles),
+        ),
+    ))
     query = _apply_status_filter(query, status)
     tasks = query.order_by(WorkflowTask.sort_order.asc(), WorkflowTask.created_at.desc()).all()
     result = [_task_payload(task, db) for task in tasks if _can_access_task(task, user)]
@@ -609,7 +609,7 @@ def get_my_tasks(
 def get_all_tasks(
     status: str = "active",
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles("admin", "manager", "production_manager")),
+    _: User = Depends(require_roles("admin", "manager")),
 ):
     split_aggregate_assembly_tasks(db)
     reconcile_stock_reservations(db)
@@ -637,7 +637,10 @@ def list_task_assignees(
     query = db.query(User).filter(User.is_active == True)
     users = query.order_by(User.full_name, User.username).all()
     if role:
-        users = [user for user in users if role in user_roles(user) or user_has_role(user, "admin", "manager")]
+        users = [
+            user for user in users
+            if user.manual_assignment_enabled and role in user_task_roles(user)
+        ]
     return [_user_payload(user) for user in users]
 
 
@@ -1329,7 +1332,7 @@ def take_task(
         raise HTTPException(status_code=400, detail="Задача уже закрыта")
     if task.status == "waiting_delivery":
         raise HTTPException(status_code=400, detail="Задача ожидает поставку и не может быть повторно взята в работу")
-    if task.type == "tester_check" and user_has_role(user, "tester"):
+    if task.type == "tester_check" and user.auto_tasks_enabled and "tester" in user_task_roles(user):
         previous_status = task.status
         task.status = "in_progress"
         task.started_at = task.started_at or utcnow()
@@ -1343,7 +1346,9 @@ def take_task(
         raise HTTPException(status_code=400, detail="Задача уже в работе у текущего пользователя")
     if task.assigned_user_id and task.assigned_user_id != user.id:
         raise HTTPException(status_code=400, detail="Задача уже назначена другому сотруднику")
-    if not user_has_role(user, "admin", "manager", "production_manager") and task.role not in user_roles(user):
+    if not user_has_role(user, "admin", "manager", "production_manager") and (
+        not user.auto_tasks_enabled or task.role not in user_task_roles(user)
+    ):
         raise HTTPException(status_code=403, detail="Эта задача назначена другой роли")
 
     ensure_not_blocked(db, task)
@@ -1531,7 +1536,7 @@ def set_task_deadline(
     task_id: int,
     payload: TaskDeadlinePayload,
     db: Session = Depends(get_db),
-    actor: User = Depends(require_roles("admin", "manager", "production_manager")),
+    actor: User = Depends(require_roles("admin", "manager")),
 ):
     task = db.query(WorkflowTask).filter(WorkflowTask.id == task_id).first()
     if not task:
@@ -1615,17 +1620,14 @@ def reorder_tasks(
         return {"status": "success"}
 
     base_query = db.query(WorkflowTask)
-    if not user_has_role(user, "admin"):
-        roles = user_roles(user)
-        role_conditions = [WorkflowTask.role.in_(roles)]
-        assignee_conditions = [
+    roles = user_task_roles(user) if user.auto_tasks_enabled else []
+    base_query = base_query.filter(or_(
+        WorkflowTask.assigned_user_id == user.id,
+        and_(
             WorkflowTask.assigned_user_id.is_(None),
-            WorkflowTask.assigned_user_id == user.id,
-        ]
-        base_query = base_query.filter(
-            or_(*role_conditions),
-            or_(*assignee_conditions),
-        )
+            WorkflowTask.role.in_(roles),
+        ),
+    ))
     tasks = _apply_status_filter(base_query, "active").all()
     if payload.column:
         tasks = [task for task in tasks if _task_kanban_column(task) == payload.column]
