@@ -401,6 +401,18 @@ def _stage_status(tasks: list[WorkflowTask]) -> str:
     return tasks[-1].status or "assigned"
 
 
+def _is_system_withdrawn_task(task: WorkflowTask) -> bool:
+    payload = task.payload or {}
+    return bool(
+        payload.get("hidden_from_task_lists")
+        or (
+            task.type == "warehouse_issue_materials"
+            and task.status == "cancelled"
+            and payload.get("cancel_reason") == "Складской остаток уменьшен до фактической выдачи"
+        )
+    )
+
+
 def _order_payload(order: Order, db: Session):
     tasks = (
         db.query(WorkflowTask)
@@ -408,6 +420,7 @@ def _order_payload(order: Order, db: Session):
         .order_by(WorkflowTask.created_at.asc(), WorkflowTask.id.asc())
         .all()
     )
+    tasks = [task for task in tasks if not _is_system_withdrawn_task(task)]
     tasks_by_type = {}
     for task in tasks:
         tasks_by_type.setdefault(task.type, []).append(task)

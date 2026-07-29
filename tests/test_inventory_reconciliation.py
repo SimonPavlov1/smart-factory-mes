@@ -141,6 +141,7 @@ class InventoryReconciliationTest(unittest.TestCase):
         self.assertEqual(self.procurement.status, "assigned")
         self.assertEqual(self.procurement.payload["shortages"][0]["qty"], 10)
         self.assertEqual(issue.status, "cancelled")
+        self.assertTrue(issue.payload["hidden_from_task_lists"])
         self.assertEqual(stock.actual_qty, 0)
         self.assertEqual(stock.reserved_qty, 0)
 
