@@ -11,6 +11,7 @@ from app.models.production import ProductType, WorkflowTask
 from app.schemas.inventory import ComponentCreate
 from app.services.auth_service import require_roles
 from app.services.inventory_movement_service import record_movement
+from app.services.workflow_service import reconcile_procurement_tasks_with_stock
 
 router = APIRouter(tags=["Склад (Inventory)"])
 INVENTORY_READ_ROLES = ("admin", "warehouse", "manager", "engineer", "production", "procurement")
@@ -318,6 +319,8 @@ def add_stock(
         actor_user_id=user.id,
         note="Ручное оприходование комплектующих",
     )
+    db.flush()
+    reconcile_procurement_tasks_with_stock(db)
     db.commit()
     return {"status": "success", "new_qty": stock_item.actual_qty}
 
@@ -393,5 +396,8 @@ def update_stock_quantity(
             actor_user_id=user.id,
             note=f"Ручная корректировка остатка: {previous_quantity:g} → {float(new_quantity):g}",
         )
+        if difference > 0:
+            db.flush()
+            reconcile_procurement_tasks_with_stock(db)
     db.commit()
     return {"status": "success", "new_qty": stock.actual_qty}
