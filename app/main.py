@@ -154,7 +154,7 @@ with SessionLocal() as db:
 app = FastAPI(
     title="Smart Factory MES API",
     description="Система управления составом изделий (BOM) и складским учетом комплектации.",
-    version="2.0.5"
+    version="2.0.6"
 )
 
 # Настройка CORS (Cross-Origin Resource Sharing).
@@ -183,6 +183,6 @@ def read_root():
     return {
         "status": "online",
         "service": "Smart Factory MES",
-        "version": "2.0.5",
+        "version": "2.0.6",
         "documentation": "/docs"
     }
