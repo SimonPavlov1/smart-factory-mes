@@ -11,7 +11,7 @@ from app.models.production import ProductType, WorkflowTask
 from app.schemas.inventory import ComponentCreate
 from app.services.auth_service import require_roles
 from app.services.inventory_movement_service import record_movement
-from app.services.workflow_service import reconcile_procurement_tasks_with_stock
+from app.services.workflow_service import reconcile_procurement_tasks_with_stock, reconcile_stock_shortfall
 
 router = APIRouter(tags=["Склад (Inventory)"])
 INVENTORY_READ_ROLES = ("admin", "warehouse", "manager", "engineer", "production", "procurement")
@@ -396,8 +396,12 @@ def update_stock_quantity(
             actor_user_id=user.id,
             note=f"Ручная корректировка остатка: {previous_quantity:g} → {float(new_quantity):g}",
         )
-        if difference > 0:
-            db.flush()
-            reconcile_procurement_tasks_with_stock(db)
+    db.flush()
+    if difference > 0:
+        reconcile_procurement_tasks_with_stock(db)
+    else:
+        # Also repairs an already inconsistent reservation when the operator
+        # saves the current quantity again after an application update.
+        reconcile_stock_shortfall(db, component_id)
     db.commit()
     return {"status": "success", "new_qty": stock.actual_qty}
