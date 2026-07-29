@@ -530,6 +530,18 @@ def _apply_status_filter(query, status: str):
     return query.filter(WorkflowTask.status == status)
 
 
+def _is_system_withdrawn_task(task: WorkflowTask) -> bool:
+    payload = task.payload or {}
+    return bool(
+        payload.get("hidden_from_task_lists")
+        or (
+            task.type == "warehouse_issue_materials"
+            and task.status == "cancelled"
+            and payload.get("cancel_reason") == "Складской остаток уменьшен до фактической выдачи"
+        )
+    )
+
+
 def _task_expected_dates(task: WorkflowTask):
     payload = task.payload or {}
     dates = []
@@ -600,7 +612,11 @@ def get_my_tasks(
     ))
     query = _apply_status_filter(query, status)
     tasks = query.order_by(WorkflowTask.sort_order.asc(), WorkflowTask.created_at.desc()).all()
-    result = [_task_payload(task, db) for task in tasks if _can_access_task(task, user)]
+    result = [
+        _task_payload(task, db)
+        for task in tasks
+        if _can_access_task(task, user) and not _is_system_withdrawn_task(task)
+    ]
     db.commit()
     return result
 
@@ -623,7 +639,7 @@ def get_all_tasks(
     query = db.query(WorkflowTask)
     query = _apply_status_filter(query, status)
     tasks = query.order_by(WorkflowTask.sort_order.asc(), WorkflowTask.created_at.desc()).all()
-    result = [_task_payload(task, db) for task in tasks]
+    result = [_task_payload(task, db) for task in tasks if not _is_system_withdrawn_task(task)]
     db.commit()
     return result
 

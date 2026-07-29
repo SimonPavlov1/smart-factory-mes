@@ -2200,6 +2200,7 @@ def reconcile_stock_shortfall(db: Session, component_id: int):
             task.payload = {
                 **task.payload,
                 "cancel_reason": "Складской остаток уменьшен до фактической выдачи",
+                "hidden_from_task_lists": True,
             }
 
         for line, quantity in withdrawn:
