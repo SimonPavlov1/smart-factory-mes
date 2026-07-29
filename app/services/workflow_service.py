@@ -2094,6 +2094,141 @@ def reconcile_procurement_tasks_with_stock(db: Session):
             }
 
 
+def _restore_procurement_shortage(db: Session, order_id: int, line: dict, quantity: float):
+    """Return a withdrawn, not-yet-issued reservation back to procurement."""
+    tasks = db.query(WorkflowTask).filter(
+        WorkflowTask.order_id == order_id,
+        WorkflowTask.type == "procurement_purchase",
+        WorkflowTask.status.in_(["assigned", "open", "in_progress", "cancelled"]),
+    ).order_by(WorkflowTask.id.desc()).all()
+    task = next((
+        candidate for candidate in tasks
+        if not (candidate.payload or {}).get("purchases")
+        and (
+            candidate.status != "cancelled"
+            or (candidate.payload or {}).get("cancel_reason") == "Дефицит закрыт свободным остатком склада"
+        )
+    ), None)
+
+    restored = {
+        **line,
+        "qty": quantity,
+        "shortage_qty": quantity,
+        "required_qty": quantity,
+        "available_qty": 0,
+    }
+    if task is None:
+        task = create_task(
+            db,
+            order_id=order_id,
+            task_type="procurement_purchase",
+            title=f"Закупить комплектующие по заказу #{order_id}",
+            role="procurement",
+            description="Оформить закупку недостающих комплектующих и передать счет бухгалтерии.",
+            payload={"shortages": _with_shortage_line_uids([restored])},
+        )
+    else:
+        payload = task.payload or {}
+        shortages = list(payload.get("shortages") or [])
+        line_uid = restored.get("line_uid")
+        match = next((
+            item for item in shortages
+            if (
+                line_uid and item.get("line_uid") == line_uid
+            ) or (
+                not line_uid
+                and int(item.get("component_id") or 0) == int(restored["component_id"])
+                and item.get("order_item_id") == restored.get("order_item_id")
+                and item.get("product_id") == restored.get("product_id")
+            )
+        ), None)
+        if match:
+            restored_qty = float(match.get("shortage_qty") or match.get("qty") or 0) + quantity
+            match.update({"qty": restored_qty, "shortage_qty": restored_qty})
+        else:
+            shortages.append(restored)
+        task.status = "assigned"
+        task.completed_at = None
+        task.payload = {
+            **payload,
+            "shortages": _with_shortage_line_uids(shortages),
+            "cancel_reason": None,
+        }
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if order:
+        order.status = "Procurement Required"
+
+
+def reconcile_stock_shortfall(db: Session, component_id: int):
+    """Withdraw unstarted issues when a manual correction makes stock insufficient."""
+    stock = db.query(Stock).filter(Stock.component_id == component_id).with_for_update().first()
+    if not stock:
+        return
+    shortfall = max(float(stock.reserved_qty or 0) - float(stock.actual_qty or 0), 0)
+    if shortfall <= 0:
+        return
+
+    tasks = db.query(WorkflowTask).filter(
+        WorkflowTask.type == "warehouse_issue_materials",
+        WorkflowTask.status.in_(["assigned", "open"]),
+    ).order_by(WorkflowTask.id.desc()).all()
+    for task in tasks:
+        if shortfall <= 0:
+            break
+        payload = task.payload or {}
+        materials = []
+        withdrawn = []
+        for line in payload.get("materials") or []:
+            if int(line.get("component_id") or 0) != int(component_id) or shortfall <= 0:
+                materials.append(line)
+                continue
+            line_qty = float(line.get("qty") or 0)
+            quantity = min(line_qty, shortfall)
+            remaining = line_qty - quantity
+            withdrawn.append((line, quantity))
+            shortfall -= quantity
+            if remaining > 0:
+                materials.append({**line, "qty": remaining})
+
+        if not withdrawn:
+            continue
+        task.payload = {**payload, "materials": materials}
+        if not materials:
+            task.status = "cancelled"
+            task.completed_at = utcnow()
+            task.payload = {
+                **task.payload,
+                "cancel_reason": "Складской остаток уменьшен до фактической выдачи",
+            }
+
+        for line, quantity in withdrawn:
+            quantity_left = quantity
+            reservations = db.query(Reservation).filter(
+                Reservation.order_id == task.order_id,
+                Reservation.component_id == component_id,
+            ).order_by(Reservation.id.desc()).all()
+            for reservation in reservations:
+                released = min(float(reservation.qty or 0), quantity_left)
+                reservation.qty = float(reservation.qty or 0) - released
+                quantity_left -= released
+                if reservation.qty <= 0:
+                    db.delete(reservation)
+                if quantity_left <= 0:
+                    break
+            _restore_procurement_shortage(db, task.order_id, line, quantity)
+
+    if shortfall > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Нельзя уменьшить остаток ниже количества, зарезервированного "
+                "в уже начатых складских выдачах"
+            ),
+        )
+    reconcile_stock_reservations(db)
+
+
 def _purchase_flow_exists(db: Session, order_id: int, purchase_id: str) -> bool:
     tasks = db.query(WorkflowTask).filter(
         WorkflowTask.order_id == order_id,

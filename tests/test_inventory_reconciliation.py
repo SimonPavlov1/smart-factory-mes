@@ -111,6 +111,39 @@ class InventoryReconciliationTest(unittest.TestCase):
         self.assertEqual(self.procurement.status, "cancelled")
         self.assertEqual(self._issue_tasks()[0].payload["materials"][0]["qty"], 10)
 
+    def test_quantity_decrease_restores_procurement_and_withdraws_unstarted_issue(self):
+        add_stock(
+            component_id=self.component.id,
+            quantity=10,
+            location="A-01",
+            db=self.db,
+            user=self.user,
+        )
+        issue = self._issue_tasks()[0]
+        self.db.refresh(self.procurement)
+        self.assertEqual(self.procurement.status, "cancelled")
+
+        # Reproduce the inconsistent state produced by an older application:
+        # quantity was lowered, while procurement and the issue stayed unchanged.
+        stock = self.db.query(Stock).filter_by(component_id=self.component.id).one()
+        stock.actual_qty = 0
+        self.db.commit()
+        update_stock_quantity(
+            component_id=self.component.id,
+            new_quantity=0,
+            db=self.db,
+            user=self.user,
+        )
+
+        self.db.refresh(self.procurement)
+        self.db.refresh(issue)
+        self.db.refresh(stock)
+        self.assertEqual(self.procurement.status, "assigned")
+        self.assertEqual(self.procurement.payload["shortages"][0]["qty"], 10)
+        self.assertEqual(issue.status, "cancelled")
+        self.assertEqual(stock.actual_qty, 0)
+        self.assertEqual(stock.reserved_qty, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
