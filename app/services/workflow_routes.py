@@ -15,6 +15,7 @@ TASK_ROUTES = {
     "repair_receive_materials": set(),
     "packer_pack": {"warehouse_finished_goods"},
     "warehouse_finished_goods": set(),
+    "order_adjustment_return": set(),
 }
 
 TASK_ROLES = {
@@ -30,6 +31,7 @@ TASK_ROLES = {
     "repair_receive_materials": "repair_engineer",
     "packer_pack": "packer",
     "warehouse_finished_goods": "warehouse",
+    "order_adjustment_return": "warehouse",
 }
 
 

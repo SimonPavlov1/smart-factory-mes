@@ -2490,6 +2490,25 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
     if not accepted_deliveries:
         raise HTTPException(status_code=400, detail="Укажите хотя бы одну закупленную позицию")
 
+    if completion_payload.get("save_only"):
+        task.payload = {
+            **payload,
+            "procurement_draft": {
+                **completion_payload,
+                "deliveries": accepted_deliveries,
+                "save_only": False,
+            },
+        }
+        task.status = "in_progress"
+        task.completed_at = None
+        if order:
+            order.status = "Procurement Required"
+        return {
+            "status": "partial",
+            "remaining": shortages,
+            "message": "Черновик закупки сохранён",
+        }
+
     purchases = list(payload.get("purchases") or [])
     for group in _group_deliveries(accepted_deliveries):
         group_items = [dict(delivery) for delivery in group["items"]]
@@ -2548,6 +2567,7 @@ def _complete_procurement_task(db: Session, task: WorkflowTask, completion_paylo
         "shortages": remaining,
         "purchases": purchases,
         "last_completion": completion_payload,
+        "procurement_draft": None,
     }
 
     if remaining:
@@ -3289,6 +3309,45 @@ def _complete_task_impl(db: Session, task: WorkflowTask, completion_payload: dic
 
     if task.type == "procurement_purchase":
         return _complete_procurement_task(db, task, completion_payload, order)
+
+    elif task.type == "order_adjustment_return":
+        incoming = (task.payload or {}).get("materials") or []
+        returned, remaining = _split_delivery_lines(incoming, completion_payload.get("items", []))
+        if not returned:
+            raise HTTPException(status_code=400, detail="Укажите хотя бы одну возвращённую позицию")
+        for line in returned:
+            component_id = int(line["component_id"])
+            quantity = float(line.get("qty") or line.get("shortage_qty") or 0)
+            stock = db.query(Stock).filter(Stock.component_id == component_id).with_for_update().first()
+            if not stock:
+                stock = Stock(component_id=component_id, actual_qty=0, reserved_qty=0, location="Warehouse-1")
+                db.add(stock)
+                db.flush()
+            stock.actual_qty = float(stock.actual_qty or 0) + quantity
+            record_movement(
+                db,
+                direction="incoming",
+                quantity=quantity,
+                balance_after=stock.actual_qty,
+                component_id=component_id,
+                location=stock.location,
+                task_id=task.id,
+                order_id=task.order_id,
+                actor_user_id=actor_user_id,
+                note="Возврат лишних комплектующих после изменения количества заказа",
+            )
+        task.payload = {
+            **(task.payload or {}),
+            "materials": remaining,
+            "return_history": [
+                *((task.payload or {}).get("return_history") or []),
+                {"created_at": utcnow().isoformat(), "items": returned},
+            ],
+            "last_completion": completion_payload,
+        }
+        task.status = "in_progress" if remaining else "done"
+        task.completed_at = None if remaining else utcnow()
+        return {"status": "partial" if remaining else "done", "remaining": remaining}
 
     elif task.type == "warehouse_receive_components":
         return _complete_warehouse_receive_task(db, task, completion_payload, order, actor_user_id)

@@ -15,14 +15,19 @@ depends_on = None
 
 
 def upgrade():
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("users")}
     with op.batch_alter_table("users") as batch_op:
-        batch_op.add_column(sa.Column("task_roles", sa.JSON(), nullable=True))
-        batch_op.add_column(sa.Column(
-            "auto_tasks_enabled", sa.Boolean(), nullable=False, server_default=sa.true()
-        ))
-        batch_op.add_column(sa.Column(
-            "manual_assignment_enabled", sa.Boolean(), nullable=False, server_default=sa.true()
-        ))
+        if "task_roles" not in columns:
+            batch_op.add_column(sa.Column("task_roles", sa.JSON(), nullable=True))
+        if "auto_tasks_enabled" not in columns:
+            batch_op.add_column(sa.Column(
+                "auto_tasks_enabled", sa.Boolean(), nullable=False, server_default=sa.true()
+            ))
+        if "manual_assignment_enabled" not in columns:
+            batch_op.add_column(sa.Column(
+                "manual_assignment_enabled", sa.Boolean(), nullable=False, server_default=sa.true()
+            ))
 
 
 def downgrade():
