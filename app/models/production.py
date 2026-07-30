@@ -159,6 +159,7 @@ class Order(Base):
     cancelled_at = Column(DateTime, nullable=True)
     financial_impact = Column(Float, nullable=False, default=0)
     cancellation_summary = Column(JSON, nullable=True)
+    adjustment_history = Column(JSON, nullable=True)
 
     # Связи
     # lazy="joined" автоматически подгружает список позиций при базовом запросе к заказу
@@ -221,6 +222,7 @@ class Item(Base):
     tested_at = Column(DateTime, nullable=True)
     packed_at = Column(DateTime, nullable=True)
     stocked_at = Column(DateTime, nullable=True)
+    is_order_surplus = Column(Boolean, nullable=False, default=False, index=True)
 
     order = relationship("Order", back_populates="items_sn")
 

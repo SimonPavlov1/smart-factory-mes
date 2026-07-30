@@ -99,6 +99,7 @@ with engine.begin() as conn:
         "cancelled_at": "DATETIME",
         "financial_impact": "FLOAT DEFAULT 0 NOT NULL",
         "cancellation_summary": "JSON",
+        "adjustment_history": "JSON",
     }
     for column_name, column_type in order_additions.items():
         if column_name not in order_columns:
@@ -119,6 +120,7 @@ with engine.begin() as conn:
         "tested_at": "DATETIME",
         "packed_at": "DATETIME",
         "stocked_at": "DATETIME",
+        "is_order_surplus": "BOOLEAN DEFAULT 0 NOT NULL",
     }
     for column_name, column_type in item_additions.items():
         if column_name not in item_columns:
@@ -154,7 +156,7 @@ with SessionLocal() as db:
 app = FastAPI(
     title="Smart Factory MES API",
     description="Система управления составом изделий (BOM) и складским учетом комплектации.",
-    version="2.0.6"
+    version="2.0.7"
 )
 
 # Настройка CORS (Cross-Origin Resource Sharing).
@@ -183,6 +185,6 @@ def read_root():
     return {
         "status": "online",
         "service": "Smart Factory MES",
-        "version": "2.0.6",
+        "version": "2.0.7",
         "documentation": "/docs"
     }

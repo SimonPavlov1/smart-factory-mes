@@ -4,8 +4,10 @@ from urllib.parse import quote
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import String, cast, func, or_
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -19,11 +21,34 @@ from app.services.auth_service import require_roles, user_roles
 from app.services.workflow_service import complete_task, create_initial_order_tasks, create_procurement_task_for_order, find_order_shortages, find_shortages, plan_material_availability, reconcile_stock_reservations
 from app.services.xlsx_service import build_table_xlsx
 from app.services.order_progress_service import aggregate_order_progress
+from app.services.order_adjustment_service import apply_order_adjustment, preview_order_adjustment
+from app.time_utils import utcnow
 
 # ИМПОРТ СХЕМ: Подтягиваем переписанные схемы из файла
 from app.schemas.order import OrderCreate, OrderOut
 
 router = APIRouter(prefix="/manufacturing", tags=["Производство (Заказы)"])
+
+ACTIVE_TASK_STATUSES = ("assigned", "open", "in_progress", "waiting_delivery", "hold", "ready_to_issue")
+
+
+def _attention_order_ids(db: Session, attention: str):
+    query = db.query(WorkflowTask.order_id).filter(
+        WorkflowTask.order_id.isnot(None),
+        WorkflowTask.status.in_(ACTIVE_TASK_STATUSES),
+    )
+    if attention == "overdue":
+        query = query.filter(or_(
+            WorkflowTask.due_date < utcnow(),
+            WorkflowTask.sla_due_at < utcnow(),
+        ))
+    elif attention == "shortages":
+        query = query.filter(WorkflowTask.type == "procurement_purchase")
+    elif attention == "hold":
+        query = query.filter(WorkflowTask.status == "hold")
+    elif attention == "unassigned":
+        query = query.filter(WorkflowTask.assigned_user_id.is_(None))
+    return query.distinct()
 
 ORDER_STAGES = [
     {
@@ -452,6 +477,7 @@ def _order_payload(order: Order, db: Session):
         "legacy_status": order.status,
         "cancellation_status": order.cancellation_status,
         "cancellation_reason": order.cancellation_reason,
+        "adjustment_history": order.adjustment_history or [],
         "progress": progress,
         "created_at": order.created_at,
         "planned_delivery_date": order.planned_delivery_date,
@@ -477,16 +503,53 @@ def _order_payload(order: Order, db: Session):
 
 @router.get("/orders", response_model=List[OrderOut], summary="Получить список всех заказов")
 def get_production_orders(
+    response: Response,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    search: str = Query("", max_length=200),
+    status_group: str = Query("all", pattern="^(all|active|cancelled)$"),
+    attention: str = Query("", pattern="^(|overdue|shortages|hold|unassigned)$"),
     db: Session = Depends(get_db),
     _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
 ):
     """
-    Возвращает список всех заказов.
+    Возвращает одну страницу заказов.
     Благодаря response_model=List[OrderOut], Pydantic автоматически трансформирует
     каждый объект, добавив внутрь позиций реальные name и sku изделий.
     """
     try:
-        orders = db.query(Order).all()
+        query = db.query(Order)
+        normalized_search = search.strip()
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            query = query.filter(or_(
+                Order.customer_name.ilike(pattern),
+                cast(Order.id, String).ilike(pattern),
+                Order.items.any(OrderItem.product.has(ProductType.name.ilike(pattern))),
+            ))
+        cancelled_condition = or_(
+            Order.cancellation_status.in_(["cancelled", "cancelled_with_commitments"]),
+            Order.status.in_(["Cancelled", "cancelled", "cancelled_with_commitments"]),
+        )
+        completed_condition = Order.status.in_(["Completed", "completed", "Ready To Ship"])
+        if status_group == "cancelled":
+            query = query.filter(cancelled_condition)
+        elif status_group == "active":
+            query = query.filter(~cancelled_condition, ~completed_condition)
+        if attention:
+            query = query.filter(Order.id.in_(_attention_order_ids(db, attention)))
+
+        total = query.count()
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Page"] = str(page)
+        response.headers["X-Page-Size"] = str(page_size)
+        orders = (
+            query
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         return [
             {
                 "id": order.id,
@@ -502,6 +565,77 @@ def get_production_orders(
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка БД: {str(e)}")
+
+
+@router.get("/orders/attention-summary", summary="Сводка заказов, требующих внимания")
+def get_orders_attention_summary(
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "warehouse", "production", "procurement", "assembler", "tester", "repair_engineer", "packer")),
+):
+    return {
+        key: db.query(func.count()).select_from(
+            _attention_order_ids(db, key).subquery()
+        ).scalar() or 0
+        for key in ("overdue", "shortages", "hold", "unassigned")
+    }
+
+
+class OrderQuantityLine(BaseModel):
+    order_item_id: int = Field(gt=0)
+    quantity: int = Field(gt=0)
+
+
+class OrderQuantityAdjustmentRequest(BaseModel):
+    items: list[OrderQuantityLine]
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+def _adjustment_quantities(payload: OrderQuantityAdjustmentRequest) -> dict[int, int]:
+    quantities = {line.order_item_id: line.quantity for line in payload.items}
+    if len(quantities) != len(payload.items):
+        raise HTTPException(status_code=422, detail="Одна позиция заказа указана несколько раз")
+    return quantities
+
+
+@router.post("/orders/{order_id}/quantity-adjustment/preview", summary="Рассчитать последствия изменения количества")
+def preview_quantity_adjustment(
+    order_id: int,
+    payload: OrderQuantityAdjustmentRequest,
+    db: Session = Depends(get_db),
+    _=Depends(require_roles("admin", "manager", "production")),
+):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    return preview_order_adjustment(db, order, _adjustment_quantities(payload))
+
+
+@router.post("/orders/{order_id}/quantity-adjustment", summary="Изменить количество изделий с перерасчётом")
+def change_order_quantities(
+    order_id: int,
+    payload: OrderQuantityAdjustmentRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "manager", "production")),
+):
+    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    try:
+        result = apply_order_adjustment(
+            db,
+            order,
+            _adjustment_quantities(payload),
+            reason=payload.reason.strip(),
+            actor_user_id=user.id,
+        )
+        db.commit()
+        return result
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Не удалось изменить заказ: {exc}")
 
 
 @router.post("/orders", summary="Создать многопозиционный заказ")
