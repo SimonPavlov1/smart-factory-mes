@@ -1458,6 +1458,7 @@ def find_order_shortages(db: Session, order_id: int) -> list[dict]:
         if shortage_qty > 0:
             shortages.append({
                 **_component_label(components.get(component_id), component_id),
+                "qty": shortage_qty,
                 "required_qty": float(material["qty"]),
                 "available_qty": available_for_order,
                 "shortage_qty": shortage_qty,
