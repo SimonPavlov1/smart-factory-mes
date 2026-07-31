@@ -21,7 +21,12 @@ from app.models.production import (
 )
 from app.services.factory_number_service import create_product_units
 from app.services.order_adjustment_service import apply_order_adjustment, preview_order_adjustment
-from app.services.workflow_service import complete_task, create_task, ensure_missing_order_item_workflows
+from app.services.workflow_service import (
+    complete_task,
+    create_task,
+    ensure_missing_order_item_workflows,
+    reconcile_procurement_tasks_with_stock,
+)
 
 
 class OrderQuantityAdjustmentTest(unittest.TestCase):
@@ -231,11 +236,14 @@ class OrderQuantityAdjustmentTest(unittest.TestCase):
         ))
         self.db.flush()
         ensure_missing_order_item_workflows(self.db)
+        reconcile_procurement_tasks_with_stock(self.db)
 
         self.assertEqual(
             {line["component_id"] for line in procurement.payload["shortages"]},
             {first_missing.id, second_missing.id},
         )
+        self.assertNotEqual(procurement.status, "cancelled")
+        self.assertTrue(all(float(line.get("qty") or 0) > 0 for line in procurement.payload["shortages"]))
 
 
 if __name__ == "__main__":
