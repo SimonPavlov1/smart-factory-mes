@@ -2,7 +2,8 @@ import unittest
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import lazyload, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
@@ -180,6 +181,19 @@ class OrderQuantityAdjustmentTest(unittest.TestCase):
         self.assertEqual(completion["status"], "done")
         self.assertEqual(return_task.status, "done")
         self.assertEqual(self.stock.actual_qty, before_stock + 8)
+
+    def test_postgresql_order_lock_does_not_join_nullable_order_items(self):
+        statement = (
+            self.db.query(Order)
+            .options(lazyload(Order.items))
+            .filter(Order.id == self.order.id)
+            .with_for_update()
+            .limit(1)
+            .statement
+        )
+        sql = str(statement.compile(dialect=postgresql.dialect()))
+        self.assertIn("FOR UPDATE", sql)
+        self.assertNotIn("JOIN order_items", sql)
 
 
 if __name__ == "__main__":

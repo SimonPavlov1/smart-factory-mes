@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 from typing import List
 
 from app.database import get_db
@@ -617,7 +617,16 @@ def change_order_quantities(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "manager", "production")),
 ):
-    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+    # Order.items is configured with joined eager loading. PostgreSQL rejects
+    # FOR UPDATE when that implicit LEFT JOIN is present, so lock only the
+    # orders row and load its items separately on first access.
+    order = (
+        db.query(Order)
+        .options(lazyload(Order.items))
+        .filter(Order.id == order_id)
+        .with_for_update()
+        .first()
+    )
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
     try:
