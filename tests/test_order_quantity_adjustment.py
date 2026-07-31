@@ -21,7 +21,7 @@ from app.models.production import (
 )
 from app.services.factory_number_service import create_product_units
 from app.services.order_adjustment_service import apply_order_adjustment, preview_order_adjustment
-from app.services.workflow_service import complete_task
+from app.services.workflow_service import complete_task, create_task, ensure_missing_order_item_workflows
 
 
 class OrderQuantityAdjustmentTest(unittest.TestCase):
@@ -194,6 +194,48 @@ class OrderQuantityAdjustmentTest(unittest.TestCase):
         sql = str(statement.compile(dialect=postgresql.dialect()))
         self.assertIn("FOR UPDATE", sql)
         self.assertNotIn("JOIN order_items", sql)
+
+    def test_bom_change_is_added_to_existing_procurement_task(self):
+        first_missing = Component(name="Первая забытая позиция", part_number="MISS-1")
+        second_missing = Component(name="Вторая забытая позиция", part_number="MISS-2")
+        self.db.add_all([first_missing, second_missing])
+        self.db.flush()
+        self.db.add(ProductBOM(
+            product_id=self.product.id,
+            design_name=first_missing.name,
+            resource_id=first_missing.id,
+            resource_type="component",
+            item_type="component",
+            quantity=1,
+            is_resolved=True,
+        ))
+        procurement = create_task(
+            self.db,
+            order_id=self.order.id,
+            task_type="procurement_purchase",
+            title="Закупить комплектующие",
+            role="procurement",
+            payload={"shortages": [{"component_id": first_missing.id, "qty": 10, "shortage_qty": 10}]},
+        )
+        self.db.flush()
+
+        # The order item already has workflow tasks; only its BOM changed.
+        self.db.add(ProductBOM(
+            product_id=self.product.id,
+            design_name=second_missing.name,
+            resource_id=second_missing.id,
+            resource_type="component",
+            item_type="component",
+            quantity=2,
+            is_resolved=True,
+        ))
+        self.db.flush()
+        ensure_missing_order_item_workflows(self.db)
+
+        self.assertEqual(
+            {line["component_id"] for line in procurement.payload["shortages"]},
+            {first_missing.id, second_missing.id},
+        )
 
 
 if __name__ == "__main__":

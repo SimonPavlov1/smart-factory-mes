@@ -1925,6 +1925,37 @@ def ensure_missing_order_item_workflows(db: Session):
         if aggregate_shortages:
             create_procurement_task_for_order(db, order, aggregate_shortages)
 
+        # A BOM can change after an order workflow has already been created.
+        # The order details calculate shortages live, while procurement stores
+        # a snapshot, so keep that snapshot synchronized with the current BOM.
+        stock_shortages = find_order_shortages(db, order.id)
+        uncovered_shortages = _uncovered_shortages(db, order.id, stock_shortages)
+        procurement = db.query(WorkflowTask).filter(
+            WorkflowTask.order_id == order.id,
+            WorkflowTask.type == "procurement_purchase",
+            WorkflowTask.status.in_(["assigned", "open", "in_progress", "hold"]),
+        ).order_by(WorkflowTask.id.asc()).first()
+        if uncovered_shortages:
+            if procurement:
+                procurement.payload = {
+                    **(procurement.payload or {}),
+                    "shortages": _with_shortage_line_uids(uncovered_shortages),
+                }
+                if procurement.status == "hold":
+                    procurement.status = "assigned"
+                procurement.completed_at = None
+            else:
+                create_procurement_task_for_order(db, order, uncovered_shortages)
+            order.status = "Procurement Required"
+        elif procurement and not (procurement.payload or {}).get("purchases"):
+            procurement.status = "cancelled"
+            procurement.completed_at = utcnow()
+            procurement.payload = {
+                **(procurement.payload or {}),
+                "shortages": [],
+                "cancel_reason": "Текущий дефицит заказа отсутствует",
+            }
+
 
 def merge_order_procurement_tasks(db: Session):
     active_statuses = ["assigned", "in_progress", "open", "waiting_delivery", "hold"]
